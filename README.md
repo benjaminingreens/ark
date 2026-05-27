@@ -106,3 +106,40 @@ ark init
 Ark is under active development.
 
 Interfaces, syntax, and behaviour may change.
+
+---
+
+## Install on Unix-like systems
+
+Requires `perl` and `git`.
+
+```sh
+mkdir -p ~/.local/src ~/.local/bin && git clone https://github.com/benjaminingreens/ark.git ~/.local/src/ark && sh ~/.local/src/ark/install.sh && (grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' ~/.profile || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile) && . ~/.profile
+```
+
+---
+
+## Update on Unix-like systems
+
+```sh
+git -C ~/.local/src/ark pull && sh ~/.local/src/ark/install.sh
+```
+
+---
+
+## Install on iSH
+
+```sh
+apk add perl git && mkdir -p ~/.local/src ~/.local/bin && git clone https://github.com/benjaminingreens/ark.git ~/.local/src/ark && sh ~/.local/src/ark/install.sh && (grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' ~/.profile || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile) && . ~/.profile
+```
+
+---
+
+## Update on iSH
+
+```sh
+git -C ~/.local/src/ark pull && sh ~/.local/src/ark/install.sh
+```
+
+---
+
