@@ -1,0 +1,1805 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use utf8;
+use File::Find;
+use Time::Local qw(timelocal);
+use Cwd qw(getcwd abs_path);
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+binmode(STDOUT, ":encoding(UTF-8)");
+binmode(STDERR, ":encoding(UTF-8)");
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+my @TYPES = qw(note todo evnt);
+my %CONFIG = load_arkrc();
+my @BASES = @{$CONFIG{bases}};
+my @records;
+my @query_warnings;
+
+my $SHOW_PROGRESS = -t STDERR && !$ENV{ARK_NO_PROGRESS};
+my $last_progress_pct = -1;
+my $shown_count = 0;
+my $NEEDS_LEADING_BLANK = 0;
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+sub cmd_init {
+    die "Already inside an ark repository\n" if find_ark_root();
+
+    make_path(".ark");
+    make_path("note");
+    make_path("todo");
+    make_path("evnt");
+
+    if (!-f ".arkrc") {
+        open my $fh, ">:encoding(UTF-8)", ".arkrc" or die "Cannot write .arkrc: $!\n";
+        print $fh "[bases]\n.\n\n[queries]\ntoday=evnt, today, >>\n\n";
+        close $fh;
+    }
+
+    print "Initialised ark repository.\n";
+}
+
+sub find_ark_root {
+    my $dir = Cwd::getcwd();
+
+    while (1) {
+        return $dir if -d "$dir/.ark";
+
+        my $parent = dirname($dir);
+        last if $parent eq $dir;
+        $dir = $parent;
+    }
+
+    return "";
+}
+
+sub eval_query_function {
+    my ($expr) = @_;
+
+    return unless $expr =~ /^(\w+)\((.*);(.*)\)$/s;
+
+    my ($name, $inner_query, $arg) = ($1, trim($2), trim($3));
+    my $fn = "arkfunc_$name";
+
+    die "Unknown query function: $name\n"
+        unless exists $CONFIG{functions}{$name}
+            || grep { $_->{name} eq $name } @{$CONFIG{inline_functions}};
+
+    die "Function '$name' did not define $fn\n"
+        unless defined &$fn;
+
+    no strict 'refs';
+    my @out = &$fn(
+        $inner_query,
+        $arg,
+        \@records,
+        sub { query_records($_[0]) },
+    );
+    use strict 'refs';
+
+    return @out;
+}
+
+sub expand_base_path {
+    my ($path) = @_;
+    $path = trim($path);
+
+    # ~/foo -> /home/user/foo
+    if ($path =~ /^~(?=\/|$)/) {
+        my $home = $ENV{HOME} || (getpwuid($<))[7] || ".";
+        $path =~ s/^~/$home/;
+    }
+
+    return $path;
+}
+
+sub load_arkrc {
+    my $cfg = ".arkrc";
+
+    my %config = (
+        bases => ["."],
+        functions => {},
+        inline_functions => [],
+        queries => {},
+    );
+
+    return %config unless -f $cfg;
+
+    open my $fh, "<:encoding(UTF-8)", $cfg or return %config;
+
+    my $section = "";
+    my $inline_name = "";
+    my $inline_code = "";
+
+    while (my $line = <$fh>) {
+        chomp $line;
+
+        if ($line =~ /^\s*\[(.+)\]\s*$/) {
+            if ($section eq "function" && length $inline_code) {
+                push @{$config{inline_functions}}, {
+                    name => $inline_name,
+                    code => $inline_code,
+                };
+                $inline_code = "";
+                $inline_name = "";
+            }
+
+            my $header = trim($1);
+
+            if ($header =~ /^function\s+(\w+)$/) {
+                $section = "function";
+                $inline_name = $1;
+            } else {
+                $section = lc $header;
+            }
+
+            next;
+        }
+
+        if ($section eq "function") {
+            $inline_code .= $line . "\n";
+            next;
+        }
+
+        $line = trim($line);
+        next unless length $line;
+        next if $line =~ /^#/;
+
+        if ($section eq "bases") {
+            push @{$config{bases}}, expand_base_path($line);
+        }
+        elsif ($section eq "functions") {
+            my ($name, $path) = split /\s*=\s*/, $line, 2;
+            next unless $name && $path;
+            $config{functions}{$name} = expand_base_path($path);
+        }
+        elsif ($section eq "queries") {
+            my ($name, $query) = split /\s*=\s*/, $line, 2;
+            next unless $name && $query;
+
+            $config{queries}{$name} = $query;
+        }
+    }
+
+    if ($section eq "function" && length $inline_code) {
+        push @{$config{inline_functions}}, {
+            name => $inline_name,
+            code => $inline_code,
+        };
+    }
+
+    close $fh;
+
+    if (@{$config{bases}} > 1) {
+        shift @{$config{bases}} if $config{bases}[0] eq ".";
+    }
+
+    return %config;
+}
+
+sub trim {
+    my ($s) = @_;
+    $s //= "";
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
+}
+
+sub width {
+    my $w = $ENV{COLUMNS};
+
+    if (!$w) {
+        my $out = `stty size 2>/dev/null`;
+        if ($out =~ /^\s*\d+\s+(\d+)/) {
+            $w = $1;
+        }
+    }
+
+    $w ||= 80;
+    $w -= 2 if $w > 24; # tiny safety margin
+
+    return $w;
+}
+
+sub wrap {
+    my ($text, $indent) = @_;
+    $text //= "";
+    $text =~ s/\s+/ /g;
+    $text = trim($text);
+
+    my $w = width();
+    $indent //= 0;
+    my $pad = " " x $indent;
+    my $max = $w - $indent;
+    $max = 20 if $max < 20;
+
+    my @words = split / /, $text;
+    my @lines;
+    my $line = "";
+
+    for my $word (@words) {
+        if (length($word) > $max) {
+            push @lines, $line if length $line;
+            while (length($word) > $max) {
+                push @lines, substr($word, 0, $max);
+                $word = substr($word, $max);
+            }
+            $line = $word;
+        }
+        elsif (!length($line)) {
+            $line = $word;
+        }
+        elsif (length($line) + 1 + length($word) <= $max) {
+            $line .= " $word";
+        }
+        else {
+            push @lines, $line;
+            $line = $word;
+        }
+    }
+
+    push @lines, $line if length $line;
+
+    return join("\n", map { $pad . $_ } @lines);
+}
+
+sub progress {
+    my ($done, $total) = @_;
+    return unless $SHOW_PROGRESS;
+    return unless $total;
+
+    my $pct = int(($done / $total) * 100);
+    return if $pct == 0;
+    return if $pct == $last_progress_pct;
+    return if $pct % 5 != 0 && $pct != 100;
+
+    print STDERR "\n" if $last_progress_pct == -1;
+
+    $last_progress_pct = $pct;
+    print STDERR "scanning $pct%\n";
+}
+
+sub progress_done {
+    return;
+}
+
+sub confirm {
+    my ($msg) = @_;
+    return 1 if $ENV{ARK_YES};
+
+    print "$msg [y/N]: ";
+    my $ans = <STDIN>;
+    chomp $ans if defined $ans;
+
+    return defined($ans) && $ans =~ /^y(es)?$/i;
+}
+
+# ============================================================
+# DATE HELPERS
+# ============================================================
+
+sub today_ymd {
+    my @t = localtime;
+    return sprintf("%04d%02d%02d", $t[5] + 1900, $t[4] + 1, $t[3]);
+}
+
+sub ymd_key_from_epoch {
+    my ($epoch) = @_;
+    my @t = localtime($epoch);
+    return sprintf("%04d%02d%02d", $t[5] + 1900, $t[4] + 1, $t[3]);
+}
+
+sub iso_wd_from_epoch {
+    my ($epoch) = @_;
+    my @t = localtime($epoch);
+    return $t[6] == 0 ? 7 : $t[6];
+}
+
+sub date_start_epoch {
+    my ($y, $m, $d) = @_;
+    return timelocal(0, 0, 0, $d, $m - 1, $y);
+}
+
+sub today_start_epoch {
+    my @t = localtime;
+    return date_start_epoch($t[5] + 1900, $t[4] + 1, $t[3]);
+}
+
+sub parse_datetime {
+    my ($s) = @_;
+    return unless defined $s && length $s;
+
+    if ($s =~ /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?)?$/) {
+        my ($y, $mo, $d, $h, $mi, $se) = ($1, $2, $3, $4, $5, $6);
+        $h  = defined $h  ? $h  : 0;
+        $mi = defined $mi ? $mi : 0;
+        $se = defined $se ? $se : 0;
+
+        return {
+            epoch    => timelocal($se, $mi, $h, $d, $mo - 1, $y),
+            has_time => defined $4 ? 1 : 0,
+        };
+    }
+
+    return;
+}
+
+sub fmt_datetime {
+    my ($epoch) = @_;
+    my @t = localtime($epoch);
+    return sprintf(
+        "%04d%02d%02dT%02d%02d",
+        $t[5] + 1900,
+        $t[4] + 1,
+        $t[3],
+        $t[2],
+        $t[1],
+    );
+}
+
+sub days_in_month {
+    my ($y, $m) = @_;
+    return 31 if $m == 1 || $m == 3 || $m == 5 || $m == 7 || $m == 8 || $m == 10 || $m == 12;
+    return 30 if $m == 4 || $m == 6 || $m == 9 || $m == 11;
+    return (($y % 400 == 0) || ($y % 4 == 0 && $y % 100 != 0)) ? 29 : 28;
+}
+
+sub add_interval {
+    my ($epoch, $n, $unit) = @_;
+    my @t = localtime($epoch);
+
+    my ($sec, $min, $hour, $day, $mon, $year) = @t[0..5];
+    $year += 1900;
+    $mon  += 1;
+
+    if ($unit eq "y") {
+        my $ny = $year + $n;
+        my $md = days_in_month($ny, $mon);
+        $day = $md if $day > $md;
+        return timelocal($sec, $min, $hour, $day, $mon - 1, $ny);
+    }
+
+    if ($unit eq "m") {
+        my $total = ($mon - 1) + $n;
+        my $ny = $year + int($total / 12);
+        my $nm = ($total % 12) + 1;
+        my $md = days_in_month($ny, $nm);
+        $day = $md if $day > $md;
+        return timelocal($sec, $min, $hour, $day, $nm - 1, $ny);
+    }
+
+    if ($unit eq "w") {
+        my ($ny, $nm, $nd) = add_calendar_days($year, $mon, $day, $n * 7);
+        return timelocal($sec, $min, $hour, $nd, $nm - 1, $ny);
+    }
+
+    if ($unit eq "d") {
+        my ($ny, $nm, $nd) = add_calendar_days($year, $mon, $day, $n);
+        return timelocal($sec, $min, $hour, $nd, $nm - 1, $ny);
+    }
+    return $epoch + ($n * 3600)      if $unit eq "h";
+    return $epoch + ($n * 60)        if $unit eq "n";
+
+    return $epoch;
+}
+
+sub add_intervals {
+    my ($epoch, $intervals) = @_;
+    for my $iv (@$intervals) {
+        $epoch = add_interval($epoch, $iv->{n}, $iv->{u});
+    }
+    return $epoch;
+}
+
+sub add_calendar_days {
+    my ($y, $m, $d, $n) = @_;
+
+    while ($n > 0) {
+        my $dim = days_in_month($y, $m);
+        if ($d + $n <= $dim) {
+            $d += $n;
+            last;
+        }
+        $n -= ($dim - $d + 1);
+        $d = 1;
+        $m++;
+        if ($m > 12) {
+            $m = 1;
+            $y++;
+        }
+    }
+
+    return ($y, $m, $d);
+}
+
+sub meta_sort_value {
+    my ($r, $sym) = @_;
+    my $v = meta_value($r, $sym);
+    return defined($v) && length($v) ? $v : "99999999999999";
+}
+
+# ============================================================
+# METADATA
+# ============================================================
+
+sub parse_meta {
+    my ($raw) = @_;
+    my @items;
+    return @items unless defined $raw;
+
+    for my $tok (split /\s*;\s*/, trim($raw)) {
+        next unless length $tok;
+
+        my ($sym, $val);
+
+        if ($tok =~ /^id\/(.+)/) {
+            ($sym, $val) = ("id/", $1);
+        } else {
+            $sym = substr($tok, 0, 1);
+            $val = substr($tok, 1);
+        }
+
+        push @items, {
+            raw => $tok,
+            sym => $sym,
+            val => $val,
+        };
+    }
+
+    return @items;
+}
+
+sub meta_to_string {
+    my ($meta_ref) = @_;
+    return join "; ", map { $_->{raw} } @$meta_ref;
+}
+
+sub has_meta {
+    my ($r, $wanted) = @_;
+
+    if ($wanted =~ /^(.+)\*$/) {
+        my $prefix = $1;
+        for my $m (@{$r->{meta}}) {
+            return 1 if index($m->{raw}, $prefix) == 0;
+        }
+        return 0;
+    }
+
+    for my $m (@{$r->{meta}}) {
+        return 1 if $m->{raw} eq $wanted;
+    }
+
+    return 0;
+}
+
+sub meta_value {
+    my ($r, $sym) = @_;
+    for my $m (@{$r->{meta}}) {
+        return $m->{val} if $m->{sym} eq $sym;
+    }
+    return "";
+}
+
+sub title_value {
+    my ($r) = @_;
+    return meta_value($r, "/");
+}
+
+sub display_meta {
+    my ($r) = @_;
+
+    return join "; ", map { $_->{raw} }
+        grep { $_->{sym} ne "id/" && $_->{raw} !~ /^id\// }
+        @{$r->{meta}};
+}
+
+sub replace_meta_raw {
+    my ($meta_ref, $prefix, $new_raw) = @_;
+
+    my @kept = grep { index($_->{raw}, $prefix) != 0 } @$meta_ref;
+    my @new  = parse_meta($new_raw);
+
+    return [@kept, @new];
+}
+
+sub remove_meta_token {
+    my ($meta_ref, $token) = @_;
+
+    if ($token =~ /^(.+)\*$/) {
+        my $prefix = $1;
+        return [grep { index($_->{raw}, $prefix) != 0 } @$meta_ref];
+    }
+
+    return [grep { $_->{raw} ne $token } @$meta_ref];
+}
+
+sub add_meta_token {
+    my ($meta_ref, $token) = @_;
+
+    return $meta_ref if grep { $_->{raw} eq $token } @$meta_ref;
+
+    my @new = parse_meta($token);
+    return [@$meta_ref, @new];
+}
+
+sub set_meta_token {
+    my ($meta_ref, $token) = @_;
+
+    my @new = parse_meta($token);
+    return $meta_ref unless @new;
+
+    my $sym = $new[0]->{sym};
+    my @kept = grep { $_->{sym} ne $sym } @$meta_ref;
+
+    return [@kept, @new];
+}
+
+sub replace_meta_token {
+    my ($meta_ref, $old, $new) = @_;
+
+    my @out;
+    for my $m (@$meta_ref) {
+        if ($m->{raw} eq $old) {
+            push @out, parse_meta($new);
+        } else {
+            push @out, $m;
+        }
+    }
+
+    return \@out;
+}
+
+sub comparison_field_needed {
+    my ($q) = @_;
+    return $1 if $q =~ /^([!%~><])\s*(<=|>=|=|<|>)\s*(.+)$/;
+    return "";
+}
+
+# ============================================================
+# RECURRENCE / PATTERN ENGINE
+# ============================================================
+
+sub parse_pattern {
+    my ($pat) = @_;
+
+    my $anchored = $pat =~ s/^\.// ? 1 : 0;
+
+    my $duration = "";
+    if ($pat =~ s/\+(\d+(?:[ymwdhn])?)$//) {
+        $duration = $1;
+    }
+
+    my @intervals;
+    while ($pat =~ /(\d+)([ymwdhn])/g) {
+        push @intervals, { n => int($1), u => $2 };
+    }
+
+    my @selectors = $pat =~ /\@([^@~]+)/g;
+    my @exclusions = $pat =~ /~([^@~]+)/g;
+
+    return {
+        anchored   => $anchored,
+        intervals  => \@intervals,
+        selectors  => \@selectors,
+        exclusions => \@exclusions,
+        duration   => $duration,
+    };
+}
+
+sub parse_duration_seconds {
+    my ($dur, $has_time) = @_;
+
+    return $has_time ? 3 * 3600 : 86400 unless $dur;
+
+    $dur =~ /^(\d+)([ymwdhn])?$/ or return $has_time ? 3 * 3600 : 86400;
+
+    my ($n, $u) = ($1, $2 || "h");
+
+    return $n * 365 * 86400 if $u eq "y";
+    return $n * 30  * 86400 if $u eq "m";
+    return $n * 7   * 86400 if $u eq "w";
+    return $n * 86400       if $u eq "d";
+    return $n * 3600        if $u eq "h";
+    return $n * 60          if $u eq "n";
+
+    return $has_time ? 3 * 3600 : 86400;
+}
+
+sub selector_numbers {
+    my ($spec) = @_;
+    my @out;
+
+    for my $part (split /,/, $spec) {
+        if ($part =~ /^(\d+)-(\d+)$/) {
+            push @out, ($1 .. $2);
+        } elsif ($part =~ /^\d+$/) {
+            push @out, int($part);
+        }
+    }
+
+    return @out;
+}
+
+sub matches_selector {
+    my ($epoch, $sel) = @_;
+    my @t = localtime($epoch);
+
+    my $minute = $t[1];
+    my $hour   = $t[2];
+    my $day    = $t[3];
+    my $wd     = $t[6] == 0 ? 7 : $t[6];
+
+    if ($sel =~ /^wd(.+)$/) {
+        my @vals = selector_numbers($1);
+        return scalar grep { $_ == $wd } @vals;
+    }
+
+    if ($sel =~ /^m(.+)$/) {
+        my @vals = selector_numbers($1);
+        return scalar grep { $_ == $day } @vals;
+    }
+
+    if ($sel =~ /^h(.+)$/) {
+        my @vals = selector_numbers($1);
+        return scalar grep { $_ == $hour } @vals;
+    }
+
+    if ($sel =~ /^n(.+)$/) {
+        my @vals = selector_numbers($1);
+        return scalar grep { $_ == $minute } @vals;
+    }
+
+    return 1;
+}
+
+sub expand_interval {
+    my ($start_epoch, $intervals, $target_epoch, $anchored) = @_;
+
+    my @s = localtime($start_epoch);
+    my $anchor = $anchored
+        ? timelocal($s[0], $s[1], $s[2], 1, 0, $s[5] + 1900)
+        : $start_epoch;
+
+    my $curr = $anchor;
+
+    while (1) {
+        my $next = add_intervals($curr, $intervals);
+        last if $next > $target_epoch;
+        last if $next == $curr;
+        $curr = $next;
+    }
+
+    return $curr;
+}
+
+sub generate_instances_for_date {
+    my ($pat_def, $start_epoch, $has_time, $target_epoch) = @_;
+
+    my $target_key = ymd_key_from_epoch($target_epoch);
+    my $start_key  = ymd_key_from_epoch($start_epoch);
+
+    return () if $target_key lt $start_key;
+
+    my $ps = expand_interval(
+        $start_epoch,
+        $pat_def->{intervals},
+        $target_epoch,
+        $pat_def->{anchored},
+    );
+
+    return () if ymd_key_from_epoch($ps) gt $target_key;
+
+    my $duration = parse_duration_seconds($pat_def->{duration}, $has_time);
+
+    my @selectors = @{$pat_def->{selectors}};
+    my @exclusions = @{$pat_def->{exclusions}};
+
+    my @wd_selectors = grep { /^wd/ } @selectors;
+    my @cands;
+
+    my @start_time = localtime($start_epoch);
+    my ($start_min, $start_hour) = ($start_time[1], $start_time[2]);
+
+    if (@wd_selectors) {
+        my %wanted_wd;
+        for my $sel (@wd_selectors) {
+            $sel =~ /^wd(.+)$/ or next;
+            $wanted_wd{$_} = 1 for selector_numbers($1);
+        }
+
+        my $ps_wd = iso_wd_from_epoch($ps);
+        my @p = localtime($ps);
+        my $ps_day_start = date_start_epoch($p[5] + 1900, $p[4] + 1, $p[3]);
+
+        for my $wd (keys %wanted_wd) {
+            my $offset = ($wd - $ps_wd) % 7;
+            my $cand = $ps_day_start + ($offset * 86400) + ($start_hour * 3600) + ($start_min * 60);
+            push @cands, $cand if ymd_key_from_epoch($cand) eq $target_key;
+        }
+    } else {
+        if (ymd_key_from_epoch($ps) eq $target_key) {
+            my @p = localtime($ps);
+            push @cands, date_start_epoch($p[5] + 1900, $p[4] + 1, $p[3])
+                       + ($start_hour * 3600)
+                       + ($start_min * 60);
+        }
+    }
+
+    @cands = grep {
+        my $epoch = $_;
+        my $ok = 1;
+        for my $sel (@selectors) {
+            next if $sel =~ /^(h|n)/;
+            $ok = 0 unless matches_selector($epoch, $sel);
+        }
+        $ok;
+    } @cands;
+
+    my @times;
+
+    for my $epoch (@cands) {
+        my @hs;
+        my @ns;
+
+        for my $sel (@selectors) {
+            if ($sel =~ /^h(.+)$/) {
+                @hs = selector_numbers($1);
+            }
+            elsif ($sel =~ /^n(.+)$/) {
+                @ns = selector_numbers($1);
+            }
+        }
+
+        @hs = ($start_hour) unless @hs;
+        @ns = ($start_min)  unless @ns;
+
+        my @d = localtime($epoch);
+        my $base = date_start_epoch($d[5] + 1900, $d[4] + 1, $d[3]);
+
+        for my $h (@hs) {
+            for my $n (@ns) {
+                next unless $h >= 0 && $h <= 23 && $n >= 0 && $n <= 59;
+                push @times, $base + ($h * 3600) + ($n * 60);
+            }
+        }
+    }
+
+    @cands = @times if @times;
+
+    @cands = grep {
+        my $epoch = $_;
+        my $excluded = 0;
+        for my $ex (@exclusions) {
+            $excluded = 1 if matches_selector($epoch, $ex);
+        }
+        !$excluded;
+    } @cands;
+
+    my @instances;
+    for my $s (@cands) {
+        next unless ymd_key_from_epoch($s) eq $target_key;
+        push @instances, [$s, $s + $duration];
+    }
+
+    @instances = sort { $a->[0] <=> $b->[0] } @instances;
+
+    return @instances;
+}
+
+sub expand_recurring_events_for_today {
+    my $target = today_start_epoch();
+    my @expanded;
+
+    for my $r (@records) {
+        if ($r->{type} eq "evnt" && meta_value($r, "^")) {
+            my $start_raw = meta_value($r, ">");
+            my $pat_raw   = meta_value($r, "^");
+
+            my $start = parse_datetime($start_raw);
+            unless ($start && $pat_raw) {
+                next;
+            }
+
+            my $pat = parse_pattern($pat_raw);
+            my @instances = generate_instances_for_date(
+                $pat,
+                $start->{epoch},
+                $start->{has_time},
+                $target,
+            );
+
+            for my $inst (@instances) {
+                my ($s, $e) = @$inst;
+
+                my @meta = map { { %$_ } } @{$r->{meta}};
+                my $meta_ref = \@meta;
+
+                $meta_ref = replace_meta_raw($meta_ref, ">", ">" . fmt_datetime($s));
+                $meta_ref = replace_meta_raw($meta_ref, "<", "<" . fmt_datetime($e));
+
+                push @expanded, {
+                    %$r,
+                    meta       => $meta_ref,
+                    instance   => 1,
+                    source_pat => $pat_raw,
+                };
+            }
+        } else {
+            push @expanded, $r;
+        }
+    }
+
+    @records = @expanded;
+}
+
+# ============================================================
+# SCANNING / PARSING RECORDS
+# ============================================================
+
+sub parse_records_from_text {
+    my ($path, $text) = @_;
+
+    while ($text =~ /((?:^|\n)\s*(todo|note|evnt)\s*:\s*.*?;;)/sg) {
+        my $raw_block = $1;
+        my $type      = $2;
+
+        my $entry = $raw_block;
+        $entry =~ s/^\s*(todo|note|evnt)\s*:\s*//s;
+        $entry =~ s/;;\s*$//s;
+        $entry = trim($entry);
+
+        my $meta_raw = "";
+        if ($entry =~ s/\{([^{}]*)\}//s) {
+            $meta_raw = $1;
+        }
+
+        my $content = trim($entry);
+        my @meta = parse_meta($meta_raw);
+
+        push @records, {
+            type      => $type,
+            content   => $content,
+            meta      => \@meta,
+            path      => $path,
+            raw_block => $raw_block,
+        };
+    }
+}
+
+sub scan_file {
+    my ($path) = @_;
+    open my $fh, "<:encoding(UTF-8)", $path or return;
+    local $/;
+    my $text = <$fh>;
+    close $fh;
+    parse_records_from_text($path, $text);
+}
+
+sub scan_all {
+    my @files;
+
+    for my $base (@BASES) {
+        for my $type (@TYPES) {
+            my $root = "$base/$type";
+            next unless -d $root;
+
+            find({
+                no_chdir => 1,
+                wanted => sub {
+                    my $p = $File::Find::name;
+                    return unless -f $p;
+                    return unless $p =~ /\.txt$/;
+                    push @files, $p;
+                }
+            }, $root);
+        }
+    }
+
+    my $total = scalar @files;
+    my $done = 0;
+
+    for my $p (@files) {
+        $done++;
+        progress($done, $total);
+        scan_file($p);
+    }
+}
+
+sub load_records {
+    @records = ();
+    $last_progress_pct = -1;
+    scan_all();
+    progress_done();
+    expand_recurring_events_for_today();
+}
+
+# ============================================================
+# QUERY
+# ============================================================
+
+sub parse_query_raw {
+    my ($raw) = @_;
+    $raw = "todo" unless defined $raw && length trim($raw);
+    return parse_query_expr($raw);
+}
+
+sub parse_query_expr {
+    my ($raw) = @_;
+    my @groups = split_top_level($raw, '|');
+
+    return sub {
+        my ($r) = @_;
+        for my $group (@groups) {
+            return 1 if query_group_matches($r, $group);
+        }
+        return 0;
+    };
+}
+
+sub query_group_matches {
+    my ($r, $group) = @_;
+
+    $group = strip_outer_parens(trim($group));
+    my @parts = split_top_level($group, ',');
+
+    for my $part (@parts) {
+        $part = trim(strip_outer_parens($part));
+        next unless length $part;
+
+        if ($part =~ /\|/) {
+            my $sub = parse_query_expr($part);
+            return 0 unless $sub->($r);
+        } else {
+            return 0 unless matches_one($r, $part);
+        }
+    }
+
+    return 1;
+}
+
+sub split_top_level {
+    my ($s, $sep) = @_;
+    my @out;
+    my $depth = 0;
+    my $buf = "";
+
+    for my $ch (split //, $s) {
+        if ($ch eq '(') {
+            $depth++;
+            $buf .= $ch;
+        }
+        elsif ($ch eq ')') {
+            $depth-- if $depth > 0;
+            $buf .= $ch;
+        }
+        elsif ($ch eq $sep && $depth == 0) {
+            push @out, trim($buf);
+            $buf = "";
+        }
+        else {
+            $buf .= $ch;
+        }
+    }
+
+    push @out, trim($buf) if length trim($buf);
+    return @out;
+}
+
+sub strip_outer_parens {
+    my ($s) = @_;
+    $s = trim($s);
+
+    while ($s =~ /^\((.*)\)$/s) {
+        my $inner = $1;
+        last unless parens_balanced($inner);
+        $s = trim($inner);
+    }
+
+    return $s;
+}
+
+sub parens_balanced {
+    my ($s) = @_;
+    my $depth = 0;
+
+    for my $ch (split //, $s) {
+        $depth++ if $ch eq '(';
+        $depth-- if $ch eq ')';
+        return 0 if $depth < 0;
+    }
+
+    return $depth == 0;
+}
+
+sub matches_one {
+    my ($r, $q) = @_;
+
+    return $r->{type} eq $q if $q =~ /^(todo|note|evnt)$/;
+
+    if ($q =~ /^([!%~><])\s*(<=|>=|=|<|>)\s*(.+)$/) {
+        return matches_comparison($r, $1, $2, trim($3));
+    }
+
+    return 1 if $q =~ /^[<>]/;
+
+    if ($q eq "today") {
+        return 0 unless $r->{type} eq "evnt";
+
+        my $start_raw = meta_value($r, ">");
+        my $start = parse_datetime($start_raw);
+        return 0 unless $start;
+
+        my $from = today_start_epoch();
+        my $to   = add_interval($from, 1, "d");
+
+        return $start->{epoch} >= $from && $start->{epoch} < $to;
+    }
+    elsif ($q eq "week") {
+        return 0 unless $r->{type} eq "evnt";
+        return 0 if meta_value($r, "^");
+
+        my $start_raw = meta_value($r, ">");
+        my $start = parse_datetime($start_raw);
+        return 0 unless $start;
+
+        my $from = today_start_epoch();
+        my $to   = add_interval($from, 7, "d");
+
+        return $start->{epoch} >= $from && $start->{epoch} < $to;
+    }
+    elsif ($q =~ /^--(.+)/) {
+        return !matches_any($r, $1);
+    }
+    elsif ($q =~ /^-(.+)/) {
+        return matches_any($r, $1);
+    }
+    else {
+        my $hay = lc($r->{content} . " " . join(" ", map { $_->{raw} } @{$r->{meta}}));
+        return index($hay, lc($q)) >= 0;
+    }
+}
+
+sub matches_comparison {
+    my ($r, $sym, $op, $wanted) = @_;
+    return 0 unless defined $sym && defined $op && defined $wanted;
+
+    my $actual = meta_value($r, $sym);
+    return 0 unless defined $actual && length $actual;
+
+    my $cmp;
+
+    if ($sym eq "!") {
+        return 0 unless $actual =~ /^\d+$/ && $wanted =~ /^\d+$/;
+        $cmp = $actual <=> $wanted;
+    } else {
+        $actual =~ s/T//g;
+        $wanted =~ s/T//g;
+
+        return 0 unless $actual =~ /^\d+$/ && $wanted =~ /^\d+$/;
+        $cmp = $actual cmp $wanted;
+    }
+
+    return $cmp <  0 if $op eq "<";
+    return $cmp >  0 if $op eq ">";
+    return $cmp == 0 if $op eq "=";
+    return $cmp <= 0 if $op eq "<=";
+    return $cmp >= 0 if $op eq ">=";
+
+    return 0;
+}
+
+sub matches_any {
+    my ($r, $q) = @_;
+
+    my @alts = grep { length } map { trim($_) } split_top_level($q, '|');
+
+    for my $alt (@alts) {
+        return 1 if matches_one($r, $alt);
+    }
+
+    return 0;
+}
+
+sub query_records {
+    my ($query) = @_;
+
+    @query_warnings = ();
+
+    my @sort_q = $query =~ /(?:^|,)\s*([<>][#!=%@\$\/\^\~])\s*(?=,|$)/g;
+
+    $query =~ s/(?:^|,)\s*[<>][#!=%@\$\/\^\~]\s*(?=,|$)/,/g;
+    $query =~ s/^\s*,\s*//;
+    $query =~ s/\s*,\s*$//;
+    $query =~ s/,\s*,/,/g;
+
+    my @out;
+    my %seen;
+
+    for my $group (split_top_level($query, '|')) {
+        $group = strip_outer_parens(trim($group));
+        next unless length $group;
+
+        my @matches;
+
+        if ($group =~ /^\w+\(.*;.*\)$/s) {
+            @matches = eval_query_function($group);
+        } else {
+            my $matcher = parse_query_raw($group);
+            @matches = grep { $matcher->($_) } @records;
+        }
+
+        for my $r (@matches) {
+            my $key = $r->{path} . "\0" . $r->{raw_block};
+            next if $seen{$key}++;
+            push @out, $r;
+        }
+    }
+
+    collect_missing_comparison_warnings($query);
+
+    return sort_records(\@out, @sort_q);
+}
+
+sub collect_missing_comparison_warnings {
+    my ($query) = @_;
+
+    my @comparisons = extract_comparisons($query);
+    return unless @comparisons;
+
+    for my $cmp (@comparisons) {
+        my ($field, $token) = @$cmp;
+
+        my $query_without_cmp = remove_query_token($query, $token);
+        my $base_matcher = parse_query_raw($query_without_cmp);
+
+        my @missing = grep {
+            $base_matcher->($_)
+            && (!defined meta_value($_, $field) || meta_value($_, $field) eq "")
+        } @records;
+
+        push @query_warnings, {
+            field => $field,
+            token => $token,
+            count => scalar(@missing),
+        } if @missing;
+    }
+}
+
+sub extract_comparisons {
+    my ($query) = @_;
+    my @out;
+
+    my @tokens = split_query_tokens($query);
+
+    for my $tok (@tokens) {
+        my $field = comparison_field_needed($tok);
+        push @out, [$field, $tok] if $field;
+    }
+
+    return @out;
+}
+
+sub split_query_tokens {
+    my ($query) = @_;
+
+    my @tokens;
+
+    for my $group (split_top_level($query, '|')) {
+        for my $part (split_top_level($group, ',')) {
+            $part = strip_outer_parens(trim($part));
+            push @tokens, $part if length $part;
+        }
+    }
+
+    return @tokens;
+}
+
+sub remove_query_token {
+    my ($query, $token) = @_;
+
+    my $quoted = quotemeta($token);
+
+    $query =~ s/(^|,)\s*$quoted\s*(?=,|$)/$1/g;
+    $query =~ s/,\s*,/,/g;
+    $query =~ s/^\s*,\s*//;
+    $query =~ s/\s*,\s*$//;
+
+    return length trim($query) ? $query : "todo|note|evnt";
+}
+
+sub sort_records {
+    my ($records_ref, @q) = @_;
+    my @rs = @$records_ref;
+    my @sorts = grep { /^[<>]/ } @q;
+
+    for my $s (reverse @sorts) {
+        my $dir = substr($s, 0, 1);
+        my $key = substr($s, 1);
+
+        # Special case:
+        if ($s eq ">>" || $s eq "<>" || $s eq "><" || $s eq "<<") {
+            my $sym  = substr($s, 1, 1);
+            my $desc = substr($s, 0, 1) eq "<";
+
+            @rs = sort {
+                my $av = meta_sort_value($a, $sym);
+                my $bv = meta_sort_value($b, $sym);
+                my $cmp = $av cmp $bv;
+                $desc ? -$cmp : $cmp;
+            } @rs;
+            next;
+        }
+
+        # General value sort:
+        # >% = ascending deadline
+        # <% = descending deadline
+        # >~ = ascending creation
+        # <~ = descending creation
+        # >! = ascending priority
+        # <! = descending priority
+        if ($key =~ /^[#!=%@\$\/\^\~]$/) {
+            my $desc = $dir eq "<";
+
+            @rs = sort {
+                my $av = meta_sort_value($a, $key);
+                my $bv = meta_sort_value($b, $key);
+                my $cmp = $av cmp $bv;
+                $desc ? -$cmp : $cmp;
+            } @rs;
+            next;
+        }
+
+        # Existing fallback: presence sort
+        @rs = sort {
+            my $av = has_meta($a, $key) ? 0 : 1;
+            my $bv = has_meta($b, $key) ? 0 : 1;
+
+            my $cmp = $av <=> $bv;
+            $dir eq ">" ? $cmp : -$cmp;
+        } @rs;
+    }
+
+    return @rs;
+}
+
+# ============================================================
+# EDITING CORE
+# ============================================================
+
+sub update_block_meta {
+    my ($block, $meta_ref) = @_;
+
+    my $meta = meta_to_string($meta_ref);
+
+    if ($block =~ /\{[^{}]*\}/s) {
+        $block =~ s/\{[^{}]*\}/{$meta}/s;
+    } else {
+        $block =~ s/\b(todo|note|evnt)\b/$1 {$meta}/s;
+    }
+
+    return $block;
+}
+
+sub edited_block {
+    my ($r, $op, @args) = @_;
+
+    my @meta = map { { %$_ } } @{$r->{meta}};
+    my $meta_ref = \@meta;
+
+    if ($op eq "add" || $op eq "a") {
+        for my $tok (@args) {
+            $meta_ref = add_meta_token($meta_ref, $tok);
+        }
+    }
+    elsif ($op eq "remove" || $op eq "r") {
+        for my $tok (@args) {
+            $meta_ref = remove_meta_token($meta_ref, $tok);
+        }
+    }
+    elsif ($op eq "set" || $op eq "s") {
+        for my $tok (@args) {
+            $meta_ref = set_meta_token($meta_ref, $tok);
+        }
+    }
+    elsif ($op eq "replace" || $op eq "p") {
+        die "replace needs OLD NEW\n" unless @args == 2;
+        $meta_ref = replace_meta_token($meta_ref, $args[0], $args[1]);
+    }
+    else {
+        die "Unknown edit operation: $op\n";
+    }
+
+    return update_block_meta($r->{raw_block}, $meta_ref);
+}
+
+sub replace_first {
+    my ($text, $old, $new) = @_;
+
+    my $idx = index($text, $old);
+    return ($text, 0) if $idx < 0;
+
+    substr($text, $idx, length($old), $new);
+    return ($text, 1);
+}
+
+sub apply_edit_to_records {
+    my ($records_ref, $op, @args) = @_;
+    my @selected = @$records_ref;
+
+    return unless @selected;
+
+    my %by_path;
+    push @{$by_path{$_->{path}}}, $_ for @selected;
+
+    my $files_changed = 0;
+    my $records_changed = 0;
+
+    for my $path (sort keys %by_path) {
+        open my $fh, "<:encoding(UTF-8)", $path or do {
+            warn "Cannot read $path: $!\n";
+            next;
+        };
+        local $/;
+        my $text = <$fh>;
+        close $fh;
+
+        my $new_text = $text;
+        my $file_changed = 0;
+
+        for my $r (@{$by_path{$path}}) {
+            my $new_block = edited_block($r, $op, @args);
+            my ($tmp, $ok) = replace_first($new_text, $r->{raw_block}, $new_block);
+
+            if ($ok) {
+                $new_text = $tmp;
+                $file_changed = 1;
+                $records_changed++;
+            } else {
+                warn "Could not replace block in $path\n";
+            }
+        }
+
+        if ($file_changed && $new_text ne $text) {
+            open my $out, ">:encoding(UTF-8)", $path or die "Cannot write $path: $!";
+            print $out $new_text;
+            close $out;
+            print "updated $path\n";
+            $files_changed++;
+        }
+    }
+
+    print "done: $records_changed record(s), $files_changed file(s) changed\n";
+    print "review with: git diff\n";
+}
+
+# ============================================================
+# GLANCE UI
+# ============================================================
+sub cmd_glance {
+    my ($query) = @_;
+    die "Usage: ark glance 'QUERY'\n" unless defined $query;
+
+    $query = resolve_query_alias($query);
+
+    my @matches = query_records($query);
+
+    print STDERR "\n$query\n\n";
+    print STDERR scalar(@matches) . " result(s)\n\n";
+
+    return unless @matches;
+
+    my $i = 1;
+    for my $r (@matches) {
+        print STDERR "\n[$i]\n";
+
+        my $meta = display_meta($r);
+        my $body = $r->{content};
+
+        if ($r->{type} eq "note") {
+            $body =~ s/\s+/ /g;
+            $body = substr($body, 0, 160) . "..." if length($body) > 160;
+        }
+
+        my $line = $r->{type} . ":";
+        $line .= " " . trim($body) if length trim($body);
+        $line .= " {$meta}" if length $meta;
+        $line .= " [$r->{path}]";
+
+        print STDERR wrap($line, 0) . "\n";
+        $i++;
+    }
+
+    print STDERR "\nSelect records for output [all/none/1,3,5-8/q]: ";
+    my $sel = <STDIN>;
+    return unless defined $sel;
+    chomp $sel;
+    $sel = trim($sel);
+
+    return if $sel =~ /^q(uit)?$/i;
+
+    my @nums = parse_selection($sel, scalar(@matches));
+    return unless @nums;
+
+    my @selected = map { $matches[$_ - 1] } @nums;
+
+    print "\n";
+    print "$query\n\n";
+    print scalar(@selected) . " selected result(s)\n\n";
+
+    for my $i (0 .. $#selected) {
+        show($selected[$i]);
+        print "\n" if $i < $#selected;
+    }
+}
+
+# ============================================================
+# EDITING UI
+# ============================================================
+
+sub show_numbered {
+    my (@items) = @_;
+
+    my $i = 1;
+    for my $r (@items) {
+        print "\n[$i]";
+        show($r);
+        $i++;
+    }
+}
+
+sub parse_selection {
+    my ($input, $max) = @_;
+    $input = trim($input // "");
+
+    return () if $input eq "" || $input =~ /^n(one)?$/i;
+    return (1 .. $max) if $input =~ /^a(ll)?$/i;
+
+    my %chosen;
+
+    for my $part (split /,/, $input) {
+        $part = trim($part);
+
+        if ($part =~ /^(\d+)-(\d+)$/) {
+            my ($a, $b) = ($1, $2);
+            ($a, $b) = ($b, $a) if $a > $b;
+            for my $n ($a .. $b) {
+                $chosen{$n} = 1 if $n >= 1 && $n <= $max;
+            }
+        }
+        elsif ($part =~ /^\d+$/) {
+            $chosen{$part} = 1 if $part >= 1 && $part <= $max;
+        }
+    }
+
+    return sort { $a <=> $b } keys %chosen;
+}
+
+sub parse_operation_line {
+    my ($line) = @_;
+    $line = trim($line // "");
+    return unless length $line;
+
+    my ($op, @args) = split /\s+/, $line;
+    return ($op, @args);
+}
+
+sub cmd_edit_batch {
+    my ($query, $op, @args) = @_;
+
+    die "Usage: ark edit 'QUERY' add|remove|set|replace TOKEN [TOKEN]\n"
+        unless defined $query && defined $op;
+
+    $query = resolve_query_alias($query);
+    my @matches = query_records($query);
+    print_query_warnings();
+
+    print scalar(@matches) . " match(es)\n";
+    show_numbered(@matches);
+
+    return unless @matches;
+
+    my $desc = join " ", ($op, @args);
+    return unless confirm("Apply edit '$desc' to all " . scalar(@matches) . " record(s)?");
+
+    apply_edit_to_records(\@matches, $op, @args);
+}
+
+sub cmd_edit_mode {
+    my ($query) = @_;
+    die "Usage: ark edit 'QUERY'\n" unless defined $query;
+
+    $query = resolve_query_alias($query);
+
+    while (1) {
+        my @matches = query_records($query);
+        print_query_warnings();
+
+        print "\n" . scalar(@matches) . " match(es)\n";
+        show_numbered(@matches);
+
+        if (!@matches) {
+            print "\nNo matches.\n";
+            return;
+        }
+
+        print "\nSelect records [all/none/1,3,5-8/q]: ";
+        my $sel = <STDIN>;
+        last unless defined $sel;
+        chomp $sel;
+        $sel = trim($sel);
+
+        last if $sel =~ /^q(uit)?$/i;
+
+        my @nums = parse_selection($sel, scalar(@matches));
+        if (!@nums) {
+            print "No records selected.\n";
+            next;
+        }
+
+        my @selected = map { $matches[$_ - 1] } @nums;
+
+        print "Operation [a/add TOKEN | r/remove TOKEN | s/set TOKEN | p/replace OLD NEW | q]: ";
+        my $line = <STDIN>;
+        last unless defined $line;
+        chomp $line;
+        $line = trim($line);
+
+        last if $line =~ /^q(uit)?$/i;
+
+        my ($op, @args) = parse_operation_line($line);
+        if (!$op || !@args) {
+            print "No operation given.\n";
+            next;
+        }
+
+        my $desc = join " ", ($op, @args);
+        next unless confirm("Apply edit '$desc' to " . scalar(@selected) . " selected record(s)?");
+
+        apply_edit_to_records(\@selected, $op, @args);
+
+        print "\nReloading records...\n";
+        load_records();
+    }
+}
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+sub show {
+    my ($r) = @_;
+
+    my $meta = display_meta($r);
+    my $body = $r->{content};
+
+    if ($r->{type} eq "note") {
+        $body =~ s/\s+/ /g;
+        $body = substr($body, 0, 160) . "..." if length($body) > 160;
+    }
+
+    my $line = $r->{type} . ":";
+    $line .= " " . trim($body) if length trim($body);
+    $line .= " {$meta}" if length $meta;
+    $line .= " [$r->{path}]";
+
+    if (-t STDOUT) {
+        print wrap($line, 0) . "\n";
+    } else {
+        print "$line\n";
+    }
+}
+
+sub usage {
+    print <<"EOF";
+Usage:
+  ark 'todo'
+  ark 'note'
+  ark 'evnt'
+  ark 'evnt, today'
+  ark 'evnt, -^*'
+  ark 'todo, -#jesse'
+  ark 'todo, --!1'
+  ark 'todo, -!1'
+  ark 'todo, >!1'
+
+Edit mode:
+  ark edit 'todo, -#jesse'
+
+Direct batch edit:
+  ark edit 'todo, -#jesse' add '#family'
+  ark edit 'todo, -#jesse' remove '#jesse'
+  ark edit 'todo, -#jesse' set '=done'
+  ark edit 'todo, -#jesse' replace '#jesse' '#family'
+
+Syntax:
+  todo content {#tag !1 =todo %20260530};;
+  evnt content {#tag >20260530T1400 <20260530T1500 ^1w\@wd1-5\@h9+3h};;
+  note content {#tag /title};;
+EOF
+}
+
+sub print_query_warnings {
+    return unless @query_warnings;
+
+    for my $w (@query_warnings) {
+        print "warning: $w->{count} otherwise matching record(s) missing '$w->{field}' for '$w->{token}'\n";
+    }
+
+    print "\n";
+}
+
+sub load_query_functions {
+    for my $name (sort keys %{$CONFIG{functions}}) {
+        my $path = $CONFIG{functions}{$name};
+
+        die "Function file not found for '$name': $path\n" unless -f $path;
+
+        require $path;
+    }
+
+    for my $fn (@{$CONFIG{inline_functions}}) {
+        my $ok = eval $fn->{code};
+        die "Inline function '$fn->{name}' failed: $@\n" if $@;
+
+        my $subname = "arkfunc_" . $fn->{name};
+        die "Inline function '$fn->{name}' did not define $subname\n"
+            unless defined &$subname;
+    }
+}
+
+sub resolve_query_alias {
+    my ($q) = @_;
+
+    return $q unless exists $CONFIG{queries}{$q};
+
+    my %seen;
+
+    while (exists $CONFIG{queries}{$q}) {
+        die "Query alias loop involving '$q'\n" if $seen{$q}++;
+        $q = $CONFIG{queries}{$q};
+    }
+
+    return $q;
+}
+
+sub ark_script_dir {
+    my $path = $0;
+
+    if ($path !~ m{/}) {
+        for my $dir (split /:/, $ENV{PATH} // "") {
+            my $candidate = "$dir/$path";
+            if (-x $candidate) {
+                $path = $candidate;
+                last;
+            }
+        }
+    }
+
+    $path = abs_path($path) if defined $path;
+    $path =~ s{/[^/]+$}{};
+
+    return $path || ".";
+}
+
+sub dispatch_command {
+    my ($cmd, @args) = @_;
+
+    return 0 unless defined $cmd && length $cmd;
+
+    my %builtins = map { $_ => 1 } qw(help init edit glance);
+    return 0 if $builtins{$cmd};
+
+    my $script_dir = ark_script_dir();
+
+    my @dirs;
+    push @dirs, $ENV{ARK_COMMAND_DIR} if $ENV{ARK_COMMAND_DIR};
+    push @dirs, "$script_dir/commands";                         # dev checkout
+    push @dirs, "$ENV{HOME}/.local/lib/ark/commands" if $ENV{HOME}; # user install
+    push @dirs, "/usr/local/lib/ark/commands";                   # manual system install
+    push @dirs, "/usr/lib/ark/commands";                         # distro/AUR install
+
+    for my $dir (@dirs) {
+        my $path = "$dir/$cmd";
+        next unless -f $path;
+
+        die "Command exists but is not executable: $path\n" unless -x $path;
+
+        exec $path, @args;
+        die "Could not run $path: $!\n";
+    }
+
+    return 0;
+}
+
+# ============================================================
+# 12. MAIN PROGRAM DISPATCH
+# ============================================================
+
+my $cmd = $ARGV[0] // "";
+
+if ($cmd eq "help" || $cmd eq "--help") {
+    usage();
+    exit;
+}
+
+if ($cmd eq "init") {
+    cmd_init();
+    exit;
+}
+
+if (!@ARGV) {
+    usage();
+    exit;
+}
+
+# All other commands must be run inside an ark repository.
+my $ARK_ROOT = find_ark_root();
+die "Not inside an ark repository. Run: ark init\n" unless $ARK_ROOT;
+
+chdir $ARK_ROOT or die "Cannot enter ark root: $ARK_ROOT\n";
+
+if (dispatch_command($cmd, @ARGV[1 .. $#ARGV])) {
+    exit;
+}
+
+# Load configured query functions and records after entering the ark root,
+# so .arkrc is read from the repository root.
+%CONFIG = load_arkrc();
+@BASES = @{$CONFIG{bases}};
+
+load_query_functions();
+load_records();
+
+if ($cmd eq "edit") {
+    shift @ARGV;
+    my $query = shift @ARGV;
+
+    if (@ARGV) {
+        my $op = shift @ARGV;
+        cmd_edit_batch($query, $op, @ARGV);
+    } else {
+        cmd_edit_mode($query);
+    }
+
+    exit;
+}
+
+if ($cmd eq "glance") {
+    shift @ARGV;
+
+    for my $qi (0 .. $#ARGV) {
+        print "\n" if $qi > 0;
+        cmd_glance($ARGV[$qi]);
+    }
+
+    exit;
+}
+
+if (!@ARGV) {
+    usage();
+    exit;
+}
+
+my @queries = @ARGV;
+
+for my $qi (0 .. $#queries) {
+    my $query = resolve_query_alias($queries[$qi]);
+    my @out = query_records($query);
+    print_query_warnings();
+
+    print "\n" if $qi > 0;
+
+    print "$query\n\n";
+    print scalar(@out) . " result(s)\n\n";
+
+    for my $i (0 .. $#out) {
+        show($out[$i]);
+        print "\n" if $i < $#out;
+    }
+}

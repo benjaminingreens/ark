@@ -1,0 +1,147 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use utf8;
+use File::Find;
+use File::Path qw(make_path);
+use File::Basename qw(dirname);
+use POSIX qw(strftime);
+
+binmode(STDOUT, ":encoding(UTF-8)");
+binmode(STDERR, ":encoding(UTF-8)");
+
+my $APPLY = grep { $_ eq "--apply" } @ARGV;
+
+my $stamp = strftime("%Y%m%dT%H%M%S", localtime);
+my $year  = substr($stamp, 0, 4);
+my $month = substr($stamp, 4, 2);
+
+my %group_path = (
+    note => "note/$year/$month/$stamp.txt",
+    todo => "todo/$year/$month/$stamp.txt",
+    evnt => "evnt/$year/$month/$stamp.txt",
+);
+
+my %grouped;
+my @delete;
+my $note_counter = 0;
+
+sub ignored_path {
+    my ($p) = @_;
+
+    return 1 if $p =~ m{(^|/)_};
+    return 1 if $p =~ m{^\./?(note|todo|evnt)(/|$)};
+    return 1 if $p =~ m{^\./?\.git(/|$)};
+    return 1 if $p =~ m{^\./?tidy_loose_txt\.pl$};
+
+    return 0;
+}
+
+sub slurp {
+    my ($p) = @_;
+    open my $fh, "<:encoding(UTF-8)", $p or return;
+    local $/;
+    return <$fh>;
+}
+
+sub write_append {
+    my ($p, $txt) = @_;
+    make_path(dirname($p));
+    open my $fh, ">>:encoding(UTF-8)", $p or die "write $p: $!";
+    print $fh $txt;
+    close $fh;
+}
+
+sub unique_note_path {
+    my $base = "note/$year/$month/$stamp.txt";
+    return $base unless -e $base;
+
+    $note_counter++;
+    my $suffix = sprintf("%03d", $note_counter);
+    return "note/$year/$month/${stamp}_$suffix.txt";
+}
+
+sub is_single_line_note {
+    my ($block) = @_;
+
+    my $tmp = $block;
+    $tmp =~ s/^\s*note:\s*//s;
+    $tmp =~ s/;;\s*$//s;
+    $tmp =~ s/^\s+|\s+$//g;
+
+    return $tmp !~ /\n/;
+}
+
+sub strip_found_blocks {
+    my ($txt) = @_;
+    $txt =~ s/(?:^|\n)\s*(?:note|todo|evnt)\s*:\s*.*?;;//sg;
+    $txt =~ s/^\s+|\s+$//g;
+    return $txt;
+}
+
+find({
+    no_chdir => 1,
+    wanted => sub {
+        my $p = $File::Find::name;
+        return unless -f $p;
+        return unless $p =~ /\.txt$/;
+        return if ignored_path($p);
+
+        my $txt = slurp($p);
+        return unless defined $txt;
+
+        my $found = 0;
+
+        while ($txt =~ /((?:^|\n)\s*(note|todo|evnt)\s*:\s*.*?;;)/sg) {
+            my ($block, $type) = ($1, $2);
+
+            $block =~ s/^\n//;
+            $block =~ s/^\s+|\s+$//g;
+
+            next unless length $block;
+
+            if ($type eq "note" && !is_single_line_note($block)) {
+                my $dst = unique_note_path();
+                print "note: $p -> $dst\n";
+                write_append($dst, "$block\n") if $APPLY;
+            } else {
+                push @{$grouped{$type}}, "$block\n\n";
+            }
+
+            $found++;
+        }
+
+        if ($found) {
+            my $leftover = strip_found_blocks($txt);
+
+            if (length $leftover) {
+                warn "not deleting $p: contains non-record text\n";
+            } else {
+                push @delete, $p;
+            }
+
+            print "found $found record(s) in $p\n";
+        }
+    }
+}, ".");
+
+for my $type (qw(note todo evnt)) {
+    next unless $grouped{$type};
+
+    my $dst = $group_path{$type};
+    my $txt = join "", @{$grouped{$type}};
+
+    print "$type: grouped -> $dst\n";
+    write_append($dst, $txt) if $APPLY;
+}
+
+if ($APPLY) {
+    for my $p (@delete) {
+        unlink $p or warn "could not delete $p: $!\n";
+    }
+
+    print "\nApplied tidy.\n";
+    print "deleted source file(s): " . scalar(@delete) . "\n";
+} else {
+    print "\nDry run only. Run with --apply to write files.\n";
+}
