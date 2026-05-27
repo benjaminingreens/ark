@@ -1,22 +1,44 @@
 #!/bin/sh
 set -eu
 
+REPO="https://github.com/benjaminingreens/ark.git"
+SRC="${HOME}/.local/src/ark"
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN="$PREFIX/bin"
 LIB="$PREFIX/lib/ark"
 
-mkdir -p "$BIN"
-mkdir -p "$LIB/commands"
+command -v git >/dev/null 2>&1 || {
+    echo "git is required"
+    exit 1
+}
 
-install -m755 ark "$BIN/ark"
+command -v perl >/dev/null 2>&1 || {
+    echo "perl is required"
+    exit 1
+}
 
-for cmd in commands/*; do
+mkdir -p "$HOME/.local/src" "$BIN" "$LIB/commands"
+
+if [ -d "$SRC/.git" ]; then
+    git -C "$SRC" pull
+else
+    git clone "$REPO" "$SRC"
+fi
+
+install -m755 "$SRC/ark" "$BIN/ark"
+
+for cmd in "$SRC"/commands/*; do
     [ -f "$cmd" ] || continue
     install -m755 "$cmd" "$LIB/commands/$(basename "$cmd")"
 done
 
-echo "Installed Ark to $BIN/ark"
-echo "Installed commands to $LIB/commands"
-echo ""
-echo "Ensure this is in your PATH:"
-echo "  export PATH=\"$BIN:\$PATH\""
+PROFILE="${HOME}/.profile"
+PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+
+if ! grep -qxF "$PATH_LINE" "$PROFILE" 2>/dev/null; then
+    echo "$PATH_LINE" >> "$PROFILE"
+fi
+
+echo "Installed Ark."
+echo "Restart your shell or run:"
+echo ". ~/.profile"
