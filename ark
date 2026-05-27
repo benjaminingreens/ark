@@ -37,6 +37,14 @@ sub cmd_init {
     make_path("todo");
     make_path("evnt");
 
+    if (!-f ".ark/repo") {
+        open my $marker, ">:encoding(UTF-8)", ".ark/repo"
+            or die "Cannot write .ark/repo: $!\n";
+
+        print $marker "ark repository\n";
+        close $marker;
+    }
+
     if (!-f ".arkrc") {
         open my $fh, ">:encoding(UTF-8)", ".arkrc" or die "Cannot write .arkrc: $!\n";
         print $fh "[bases]\n.\n\n[queries]\ntoday=evnt, today, >>\n\n";
