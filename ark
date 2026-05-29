@@ -1771,12 +1771,14 @@ sub load_builtin_arkfuncs {
     my $script_dir = ark_script_dir();
 
     my @paths = (
-        "$script_dir/other/arkfuncs.pl",              # dev checkout
+        "$script_dir/other/arkfuncs.pl",
         "$script_dir/arkfuncs.pl",
-        "$ENV{HOME}/.local/lib/ark/other/arkfuncs.pl" if $ENV{HOME},
         "/usr/local/lib/ark/other/arkfuncs.pl",
         "/usr/lib/ark/other/arkfuncs.pl",
     );
+
+    push @paths, "$ENV{HOME}/.local/lib/ark/other/arkfuncs.pl"
+        if defined $ENV{HOME} && length $ENV{HOME};
 
     for my $path (@paths) {
         next unless defined $path && -f $path;
