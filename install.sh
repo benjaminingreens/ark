@@ -25,9 +25,10 @@ else
     git clone "$REPO" "$SRC"
 fi
 
-install -m755 "$SRC/ark" "$BIN/ark"
+install -m755 "$SRC/bin/ark" "$BIN/ark"
+install -m644 "$SRC/lib/ark/arkfuncs.pl" "$LIB/arkfuncs.pl"
 
-for cmd in "$SRC"/commands/*; do
+for cmd in "$SRC"/lib/ark/commands/*; do
     [ -f "$cmd" ] || continue
     install -m755 "$cmd" "$LIB/commands/$(basename "$cmd")"
 done
@@ -35,7 +36,9 @@ done
 PROFILE="${HOME}/.profile"
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 
-if ! grep -qxF "$PATH_LINE" "$PROFILE" 2>/dev/null; then
+touch "$PROFILE"
+
+if ! grep -qxF "$PATH_LINE" "$PROFILE"; then
     echo "$PATH_LINE" >> "$PROFILE"
 fi
 

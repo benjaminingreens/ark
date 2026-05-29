@@ -1771,14 +1771,11 @@ sub load_builtin_arkfuncs {
     my $script_dir = ark_script_dir();
 
     my @paths = (
-        "$script_dir/other/arkfuncs.pl",
-        "$script_dir/arkfuncs.pl",
-        "/usr/local/lib/ark/other/arkfuncs.pl",
-        "/usr/lib/ark/other/arkfuncs.pl",
+        "$script_dir/../lib/ark/arkfuncs.pl",
+        "$ENV{HOME}/.local/lib/ark/arkfuncs.pl",
+        "/usr/local/lib/ark/arkfuncs.pl",
+        "/usr/lib/ark/arkfuncs.pl",
     );
-
-    push @paths, "$ENV{HOME}/.local/lib/ark/other/arkfuncs.pl"
-        if defined $ENV{HOME} && length $ENV{HOME};
 
     for my $path (@paths) {
         next unless defined $path && -f $path;
@@ -1801,7 +1798,7 @@ sub dispatch_command {
 
     my @dirs;
     push @dirs, $ENV{ARK_COMMAND_DIR} if $ENV{ARK_COMMAND_DIR};
-    push @dirs, "$script_dir/commands";                         # dev checkout
+    push @dirs, "$script_dir/../lib/ark/commands";
     push @dirs, "$ENV{HOME}/.local/lib/ark/commands" if $ENV{HOME}; # user install
     push @dirs, "/usr/local/lib/ark/commands";                   # manual system install
     push @dirs, "/usr/lib/ark/commands";                         # distro/AUR install
