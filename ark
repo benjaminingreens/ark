@@ -1771,19 +1771,20 @@ sub load_builtin_arkfuncs {
     my $script_dir = ark_script_dir();
 
     my @paths = (
-        "$script_dir/other/arkfuncs",
-        "$script_dir/other/arkfuncs.pl",
-        "$script_dir/arkfuncs",
+        "$script_dir/other/arkfuncs.pl",              # dev checkout
         "$script_dir/arkfuncs.pl",
+        "$ENV{HOME}/.local/lib/ark/other/arkfuncs.pl" if $ENV{HOME},
+        "/usr/local/lib/ark/other/arkfuncs.pl",
+        "/usr/lib/ark/other/arkfuncs.pl",
     );
 
     for my $path (@paths) {
-        next unless -f $path;
+        next unless defined $path && -f $path;
         require $path;
         return 1;
     }
 
-    return 0;
+    die "Could not find arkfuncs.pl\n";
 }
 
 sub dispatch_command {
