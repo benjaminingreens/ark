@@ -176,7 +176,7 @@ sub unique_path {
     $ext //= "";
 
     for my $i (1..9999) {
-        my $candidate = sprintf "%s/%s_%03d%s", $dir, $stem, $i, $ext;
+        my $candidate = sprintf "%s/%s-%03d%s", $dir, $stem, $i, $ext;
         return $candidate unless -e $candidate;
     }
 
@@ -331,7 +331,7 @@ sub is_multiline_content {
 }
 
 sub normalise_record {
-    my ($type, $content, $meta) = @_;
+    my ($type, $content, $meta, $force_multiline_note) = @_;
 
     $content = trim($content);
 
@@ -355,8 +355,8 @@ sub normalise_record {
 
     my $meta_txt = join "; ", @tokens;
 
-    if ($type eq "note" && is_multiline_content($content)) {
-        return "$type: {$meta_txt}\n\n$content\n\n;;";
+    if ($type eq "note" && ($force_multiline_note || is_multiline_content($content))) {
+        return "$type: {$meta_txt}\n\n$content\n\n;;\n";
     }
 
     return "$type: $content {$meta_txt};;";
@@ -387,18 +387,31 @@ sub is_single_line_note {
 
 sub output_batch_path {
     my ($type, $year, $month) = @_;
-    return unique_path("$TYPE_DIR{$type}/$year/$month/$RUN_STAMP.txt");
+
+    my $ym = "$year$month";
+    my $dir = "$TYPE_DIR{$type}/$year/$month";
+
+    for my $i (1..999) {
+        my $path = sprintf "%s/%s_%s_%03d.txt", $dir, $type, $ym, $i;
+        return $path unless -e $path;
+    }
+
+    die "could not create batch path for $type $ym";
 }
 
 sub output_multiline_note_path {
-    my ($record) = @_;
+    my ($record, $src) = @_;
 
     my ($year, $month) = ym_of_record($record);
 
     my $title = extract_title($record);
-    my $name = $title ? slug($title) : sprintf("%s_%03d", stamp_of_record($record), ++$note_counter);
+    my $name = $title ? slug($title) : lc stamp_of_record($record);
 
-    return unique_path("note/$year/$month/$name.txt");
+    my $path = "note/$year/$month/$name.txt";
+
+    return $path if defined $src && $src eq $path;
+
+    return unique_path($path);
 }
 
 sub process_file {
@@ -423,24 +436,27 @@ sub process_file {
         my $was_single_line_note =
             $type eq "note" && $whole =~ /^\s*note:[^\n]*;;\s*$/;
 
-        my $record = normalise_record($type, $content, $meta);
+        my $record = normalise_record($type, $content, $meta, !$was_single_line_note);
 
         $found++;
 
         if ($move_out) {
             if ($type eq "note" && !$was_single_line_note) {
-                my $dst = output_multiline_note_path($record);
+                my $dst = output_multiline_note_path($record, $p);
                 print "note: $p -> $dst\n";
-                append_file($dst, "$record\n") if $APPLY;
+                append_file($dst, $record) if $APPLY;
             } else {
                 my ($year, $month) = ym_of_record($record);
                 push @{$grouped{$type}{$year}{$month}}, "$record\n";
             }
         } else {
-            $new_txt .= "$record\n";
+            $new_txt .= $record;
+            $new_txt .= "\n" unless $record =~ /\n\z/;
         }
 
         $pos = $end;
+        $pos += length($1) if substr($txt, $pos) =~ /^(\s+)/;
+
     }
 
     return unless $found;
@@ -491,7 +507,15 @@ sub run_organise {
         my $move_out = 0;
 
         if ($TIDY) {
-            $move_out = protected_underscore_file($p) ? 0 : 1;
+            if (protected_underscore_file($p)) {
+                $move_out = 0;
+            }
+            elsif (is_item_month_file($p)) {
+                $move_out = 0;
+            }
+            else {
+                $move_out = 1;
+            }
         }
 
         process_file($p, $move_out);
@@ -508,7 +532,7 @@ sub run_organise {
                     $txt =~ s/\n+\z/\n/s;
 
                     print "$type: grouped -> $dst\n";
-                    append_file($dst, $txt) if $APPLY;
+                    write_file($dst, $txt) if $APPLY;
                 }
             }
         }
@@ -598,14 +622,38 @@ sub compact_type_month {
 
     return unless @records;
 
+    my %seen;
+    my @deduped;
+
+    for my $r (@records) {
+        my $key = "";
+
+        if ($r =~ /(?:^|[{\s;])&([A-Za-z0-9_-]+)/) {
+            $key = "id:$1";
+        } else {
+            my $normalised = $r;
+            $normalised =~ s/\s+/ /g;
+            $key = "text:$normalised";
+        }
+
+        next if $seen{$key}++;
+        push @deduped, $r;
+    }
+
+    my $before = scalar @records;
+    my $after  = scalar @deduped;
+
+    print "compact $type/$year/$month: $before -> $after\n";
+
     @records = sort {
         created_of($a) cmp created_of($b)
             || $a cmp $b
-    } @records;
+    } @deduped;
 
     my $chunk = 1;
     my $count = 0;
     my $out = "";
+    my %written_files;
 
     for my $r (@records) {
         $out .= "$r\n";
@@ -616,6 +664,7 @@ sub compact_type_month {
             $out =~ s/\n+\z/\n/s;
             print "compact: $path\n";
             write_file($path, $out) if $APPLY;
+            $written_files{$path} = 1;
             $out = "";
             $count = 0;
         }
@@ -626,11 +675,12 @@ sub compact_type_month {
         $out =~ s/\n+\z/\n/s;
         print "compact: $path\n";
         write_file($path, $out) if $APPLY;
+        $written_files{$path} = 1;
     }
 
     if ($APPLY) {
         for my $p (@old_files) {
-            next if $p =~ m{/$type\_${year}${month}_\d{3}\.txt$};
+            next if $written_files{$p};
             unlink $p or warn "could not remove old compact source $p: $!\n";
         }
     }
