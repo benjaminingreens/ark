@@ -380,27 +380,25 @@ sub is_single_line_note {
 
     return 0 unless $record =~ /^\s*note:/;
 
-    my $raw = $record;
-    $raw =~ s/^\s*note:\s*//s;
-    $raw =~ s/\s*;;\s*$//s;
-
-    my ($content, undef) = split_content_meta($raw);
-
-    return $content !~ /\n/;
+    # Benjamin's rule:
+    # single-line means `note:` and `;;` occur on the same physical line.
+    return $record =~ /^\s*note:[^\n]*;;\s*$/;
 }
 
 sub output_batch_path {
-    my ($type) = @_;
-    return unique_path("$TYPE_DIR{$type}/$YEAR/$MONTH/$RUN_STAMP.txt");
+    my ($type, $year, $month) = @_;
+    return unique_path("$TYPE_DIR{$type}/$year/$month/$RUN_STAMP.txt");
 }
 
 sub output_multiline_note_path {
     my ($record) = @_;
 
-    my $title = extract_title($record);
-    my $name = $title ? slug($title) : sprintf("%s_%03d", $RUN_STAMP, ++$note_counter);
+    my ($year, $month) = ym_of_record($record);
 
-    return unique_path("note/$YEAR/$MONTH/$name.txt");
+    my $title = extract_title($record);
+    my $name = $title ? slug($title) : sprintf("%s_%03d", stamp_of_record($record), ++$note_counter);
+
+    return unique_path("note/$year/$month/$name.txt");
 }
 
 sub process_file {
@@ -421,17 +419,22 @@ sub process_file {
         $new_txt .= substr($txt, $pos, $start - $pos);
 
         my ($content, $meta) = split_content_meta($raw);
+
+        my $was_single_line_note =
+            $type eq "note" && $whole =~ /^\s*note:[^\n]*;;\s*$/;
+
         my $record = normalise_record($type, $content, $meta);
 
         $found++;
 
         if ($move_out) {
-            if ($type eq "note" && !is_single_line_note($record)) {
+            if ($type eq "note" && !$was_single_line_note) {
                 my $dst = output_multiline_note_path($record);
                 print "note: $p -> $dst\n";
                 append_file($dst, "$record\n") if $APPLY;
             } else {
-                push @{$grouped{$type}}, "$record\n";
+                my ($year, $month) = ym_of_record($record);
+                push @{$grouped{$type}{$year}{$month}}, "$record\n";
             }
         } else {
             $new_txt .= "$record\n";
@@ -498,12 +501,16 @@ sub run_organise {
         for my $type (qw(note todo evnt)) {
             next unless $grouped{$type};
 
-            my $dst = output_batch_path($type);
-            my $txt = join "", @{$grouped{$type}};
-            $txt =~ s/\n+\z/\n/s;
+            for my $year (sort keys %{$grouped{$type}}) {
+                for my $month (sort keys %{$grouped{$type}{$year}}) {
+                    my $dst = output_batch_path($type, $year, $month);
+                    my $txt = join "", @{$grouped{$type}{$year}{$month}};
+                    $txt =~ s/\n+\z/\n/s;
 
-            print "$type: grouped -> $dst\n";
-            append_file($dst, $txt) if $APPLY;
+                    print "$type: grouped -> $dst\n";
+                    append_file($dst, $txt) if $APPLY;
+                }
+            }
         }
     }
 
@@ -528,6 +535,20 @@ sub created_of {
     my ($r) = @_;
     return $1 if $r =~ /(?:^|[{\s;])~([0-9T]+)/;
     return "";
+}
+
+sub stamp_of_record {
+    my ($record) = @_;
+
+    return $1 if $record =~ /(?:^|[{\s;])~([0-9]{8}T?[0-9]*)/;
+    return $RUN_STAMP;
+}
+
+sub ym_of_record {
+    my ($record) = @_;
+
+    my $stamp = stamp_of_record($record);
+    return (substr($stamp, 0, 4), substr($stamp, 4, 2));
 }
 
 sub compact_type_month {
