@@ -1,6 +1,5 @@
-LEVEL 1 TIDY
-------------
-- open inbox.txt only
+CLEAN
+=====
 - format:
   - for todos, evnts, and one line notes, ensure one whitespace between 'note:' and content
 	- other sensible formatting
@@ -8,21 +7,42 @@ LEVEL 1 TIDY
 	  - ~creation and id and authour ($) for all, =status and @assignees for todos, and #general for all if no tag
 		  - authour and assignee comes from config file (.arkrc) defaults if present
 	- order metadata?
-- sorting
+
+LEVEL 1: inbox.txt only
+-----------------------
+LEVEL 2: all loose files
+------------------------
+LEVEL 3: all files in item/yyyy/mm/dd dirs
+------------------------------------------
+LEVEL 4: all files
+------------------
+
+TIDY
+====
+- format above
+- AND sorting
   - group one line todos, notes, and events
 	- create new relevant files in the relevant item/yyyy/mm/ dirs
 	  - filename = yyyymmddthhmmss? [how to ensure no clashes?]
 	- also create relevant files for multiline notes
 	  - filename = /title if there is one. yyyymmddthhmmss otherwise [again, how to ensure no clashes?]
 	- remove from inbox
+  - do not move items out of a file beginning with a _, but do update/format their contents
 
-LEVEL 2 TIDY
-------------
-- do above but for all loose text files - that is all files not within an item/yyyy/mm dir
-- do not move items out of a file beginning with a _, but do update their contents
+LEVEL 1: inbox.txt only
+-----------------------
+LEVEL 2: all loose files
+------------------------
+LEVEL 3: all files in item/yyyy/mm/dd dirs
+------------------------------------------
+LEVEL 4: all files
+------------------
 
 COMPACTING
-----------
-- ensuring files contain no more than 1000 lines (not including multiline notes obviously)
+==========
+- ensuring files in /item/yyyy/mm/dd dirs contain no more than 1000 lines (not including multiline notes obviously)
 
-- both level 1 and 2 tidy can be called with compacting
+---
+
+any of these arguments can be called in any order (would that even work)
+so that's 9 types of 'organising' arguments in total, as well as all their possible combinations

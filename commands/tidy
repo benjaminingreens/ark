@@ -10,9 +10,29 @@ use POSIX qw(strftime);
 binmode(STDOUT, ":encoding(UTF-8)");
 binmode(STDERR, ":encoding(UTF-8)");
 
-my $APPLY   = grep { $_ eq "--apply" } @ARGV;
-my $ALL     = grep { $_ eq "--all" } @ARGV;
-my $COMPACT = grep { $_ eq "--compact" } @ARGV;
+my $APPLY   = has_arg("--apply");
+my $CLEAN   = has_arg("--clean");
+my $TIDY    = has_arg("--tidy");
+my $COMPACT = has_arg("--compact");
+
+my $LEVEL =
+    has_arg("--4") ? 4 :
+    has_arg("--3") ? 3 :
+    has_arg("--2") ? 2 :
+    has_arg("--1") ? 1 :
+    1;
+
+my $HAS_OPERATION = $CLEAN || $TIDY || $COMPACT;
+
+# plain `ark tidy` behaves as alias for `ark tidy --tidy --1`
+if (!$HAS_OPERATION) {
+    $TIDY = 1;
+    $LEVEL = 1;
+}
+
+if ($TIDY && $CLEAN) {
+    $CLEAN = 0;
+}
 
 my $RUN_STAMP = strftime("%Y%m%dT%H%M%S", localtime);
 my $DATE_ID   = strftime("%Y%m%d%H%M%S", localtime);
@@ -27,7 +47,7 @@ my %TYPE_DIR = (
 
 my %conf = read_arkrc(".arkrc");
 
-my $REPO        = $conf{repo}     || $conf{repo_id} || basename_abs(".");
+my $REPO        = $conf{repo}     || $conf{repo_id} || basename_abs();
 my $AUTHOUR     = $conf{authour}  || "";
 my $ASSIGNEE    = $conf{assignee} || "";
 my $DEFAULT_TAG = $conf{tag}      || "general";
@@ -43,10 +63,14 @@ my $note_counter = 0;
 my $SHOW_PROGRESS = -t STDERR && !$ENV{ARK_NO_PROGRESS};
 my $last_progress_pct = -1;
 
+sub has_arg {
+    my ($arg) = @_;
+    return scalar grep { $_ eq $arg } @ARGV;
+}
+
 sub progress {
     my ($label, $done, $total) = @_;
-    return unless $SHOW_PROGRESS;
-    return unless $total;
+    return unless $SHOW_PROGRESS && $total;
 
     my $pct = int(($done / $total) * 100);
     return if $pct == $last_progress_pct;
@@ -132,7 +156,14 @@ sub random_hex {
 }
 
 sub new_id {
-    return "id/" . $REPO . $DATE_ID . random_hex(12);
+    return "&" . $REPO . $DATE_ID . random_hex(12);
+}
+
+sub trim {
+    my ($s) = @_;
+    $s //= "";
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
 }
 
 sub unique_path {
@@ -156,31 +187,62 @@ sub slug {
     my ($s) = @_;
     $s //= "";
     $s = lc $s;
-    $s =~ s/^\s+|\s+$//g;
+    $s = trim($s);
     $s =~ s/[^a-z0-9]+/-/g;
     $s =~ s/^-+|-+$//g;
     $s ||= $RUN_STAMP;
     return substr($s, 0, 80);
 }
 
-sub ignored_for_level2_move {
+sub normalise_title_token {
+    my ($tok) = @_;
+
+    return $tok unless $tok =~ m{^/(.+)$};
+
+    my $title = slug($1);
+
+    return "/$title";
+}
+
+sub is_item_month_file {
     my ($p) = @_;
-    return 1 if $p =~ m{^\./?\.git(/|$)};
-    return 1 if $p =~ m{^\./?(note|todo|evnt)/\d{4}/\d{2}/};
-    return 1 if $p =~ m{^\./?tidy(?:\.pl|_loose_txt\.pl)?$};
+    return $p =~ m{^(?:\./)?(?:note|todo|evnt)/\d{4}/\d{2}/[^/]+\.txt$};
+}
+
+sub ignored_file {
+    my ($p) = @_;
+
+    return 1 if $p =~ m{^(?:\./)?\.git/};
+    return 1 if $p =~ m{^(?:\./)?tidy(?:\.pl|_loose_txt\.pl)?$};
+
     return 0;
+}
+
+sub wanted_by_level {
+    my ($p) = @_;
+
+    return 0 unless -f $p;
+    return 0 unless $p =~ /\.txt$/;
+    return 0 if ignored_file($p);
+
+    if ($LEVEL == 1) {
+        return $p eq "inbox.txt" || $p eq "./inbox.txt";
+    }
+
+    if ($LEVEL == 2) {
+        return !is_item_month_file($p);
+    }
+
+    if ($LEVEL == 3) {
+        return is_item_month_file($p);
+    }
+
+    return 1;
 }
 
 sub protected_underscore_file {
     my ($p) = @_;
     return basename($p) =~ /^_/;
-}
-
-sub trim {
-    my ($s) = @_;
-    $s //= "";
-    $s =~ s/^\s+|\s+$//g;
-    return $s;
 }
 
 sub parse_meta {
@@ -212,6 +274,7 @@ sub split_content_meta {
 
 sub token_kind {
     my ($tok) = @_;
+
     return "title"    if $tok =~ m{^/};
     return "tag"      if $tok =~ /^#/;
     return "status"   if $tok =~ /^=/;
@@ -223,15 +286,17 @@ sub token_kind {
     return "end"      if $tok =~ /^</;
     return "repeat"   if $tok =~ /^\^/;
     return "created"  if $tok =~ /^~/;
-    return "id"       if $tok =~ m{^id/};
+    return "id"       if $tok =~ /^&/;
     return "other";
 }
 
 sub has_kind {
     my ($tokens, $kind) = @_;
+
     for my $t (@$tokens) {
         return 1 if token_kind($t) eq $kind;
     }
+
     return 0;
 }
 
@@ -272,6 +337,8 @@ sub normalise_record {
 
     my @tokens = parse_meta($meta);
 
+    @tokens = map { normalise_title_token($_) } @tokens;
+
     push @tokens, "~$RUN_STAMP" unless has_kind(\@tokens, "created");
     push @tokens, new_id()      unless has_kind(\@tokens, "id");
 
@@ -280,6 +347,7 @@ sub normalise_record {
 
     if ($type eq "todo") {
         push @tokens, "=todo" unless has_kind(\@tokens, "status");
+        push @tokens, "!3"    unless has_kind(\@tokens, "priority");
         push @tokens, "\@$ASSIGNEE" if $ASSIGNEE && !has_kind(\@tokens, "assignee");
     }
 
@@ -363,7 +431,7 @@ sub process_file {
                 print "note: $p -> $dst\n";
                 append_file($dst, "$record\n") if $APPLY;
             } else {
-                push @{$grouped{$type}}, "$record\n\n";
+                push @{$grouped{$type}}, "$record\n";
             }
         } else {
             $new_txt .= "$record\n";
@@ -392,23 +460,22 @@ sub process_file {
     print "found $found record(s) in $p\n";
 }
 
-sub run_tidy {
+sub collect_files {
     my @files;
 
-    if ($ALL) {
-        find({
-            no_chdir => 1,
-            wanted => sub {
-                my $p = $File::Find::name;
-                return unless -f $p;
-                return unless $p =~ /\.txt$/;
-                return if ignored_for_level2_move($p);
-                push @files, $p;
-            }
-        }, ".");
-    } else {
-        push @files, "inbox.txt" if -f "inbox.txt";
-    }
+    find({
+        no_chdir => 1,
+        wanted => sub {
+            my $p = $File::Find::name;
+            push @files, $p if wanted_by_level($p);
+        }
+    }, ".");
+
+    return sort @files;
+}
+
+sub run_organise {
+    my @files = collect_files();
 
     my $total = scalar @files;
     my $done = 0;
@@ -416,20 +483,28 @@ sub run_tidy {
 
     for my $p (@files) {
         $done++;
-        progress("tidying", $done, $total);
+        progress($TIDY ? "tidying" : "cleaning", $done, $total);
 
-        my $move_out = $ALL && protected_underscore_file($p) ? 0 : 1;
+        my $move_out = 0;
+
+        if ($TIDY) {
+            $move_out = protected_underscore_file($p) ? 0 : 1;
+        }
+
         process_file($p, $move_out);
     }
 
-    for my $type (qw(note todo evnt)) {
-        next unless $grouped{$type};
+    if ($TIDY) {
+        for my $type (qw(note todo evnt)) {
+            next unless $grouped{$type};
 
-        my $dst = output_batch_path($type);
-        my $txt = join "", @{$grouped{$type}};
+            my $dst = output_batch_path($type);
+            my $txt = join "", @{$grouped{$type}};
+            $txt =~ s/\n+\z/\n/s;
 
-        print "$type: grouped -> $dst\n";
-        append_file($dst, $txt) if $APPLY;
+            print "$type: grouped -> $dst\n";
+            append_file($dst, $txt) if $APPLY;
+        }
     }
 
     if ($APPLY) {
@@ -517,6 +592,7 @@ sub compact_type_month {
 
         if ($count >= 1000) {
             my $path = sprintf "%s/%s_%s%s_%03d.txt", $dir, $type, $year, $month, $chunk++;
+            $out =~ s/\n+\z/\n/s;
             print "compact: $path\n";
             write_file($path, $out) if $APPLY;
             $out = "";
@@ -526,6 +602,7 @@ sub compact_type_month {
 
     if (length $out) {
         my $path = sprintf "%s/%s_%s%s_%03d.txt", $dir, $type, $year, $month, $chunk++;
+        $out =~ s/\n+\z/\n/s;
         print "compact: $path\n";
         write_file($path, $out) if $APPLY;
     }
@@ -569,12 +646,24 @@ sub run_compact {
     }
 }
 
-run_tidy();
+run_organise() if $CLEAN || $TIDY;
 run_compact() if $COMPACT;
+
+my $operation =
+    $TIDY    ? "tidy" :
+    $CLEAN   ? "clean" :
+    $COMPACT ? "compact" :
+    "none";
 
 if ($APPLY) {
     print "\nApplied tidy.\n";
+    print "operation: $operation\n";
+    print "level: $LEVEL\n";
+    print "compact: " . ($COMPACT ? "yes" : "no") . "\n";
     print "deleted source file(s): " . scalar(@delete_files) . "\n";
 } else {
     print "\nDry run only. Run with --apply to write files.\n";
+    print "operation: $operation\n";
+    print "level: $LEVEL\n";
+    print "compact: " . ($COMPACT ? "yes" : "no") . "\n";
 }
