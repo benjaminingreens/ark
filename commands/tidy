@@ -4,144 +4,577 @@ use warnings;
 use utf8;
 use File::Find;
 use File::Path qw(make_path);
-use File::Basename qw(dirname);
+use File::Basename qw(dirname basename);
 use POSIX qw(strftime);
 
 binmode(STDOUT, ":encoding(UTF-8)");
 binmode(STDERR, ":encoding(UTF-8)");
 
-my $APPLY = grep { $_ eq "--apply" } @ARGV;
+my $APPLY   = grep { $_ eq "--apply" } @ARGV;
+my $ALL     = grep { $_ eq "--all" } @ARGV;
+my $COMPACT = grep { $_ eq "--compact" } @ARGV;
 
-my $stamp = strftime("%Y%m%dT%H%M%S", localtime);
-my $year  = substr($stamp, 0, 4);
-my $month = substr($stamp, 4, 2);
+my $RUN_STAMP = strftime("%Y%m%dT%H%M%S", localtime);
+my $DATE_ID   = strftime("%Y%m%d%H%M%S", localtime);
+my $YEAR      = substr($RUN_STAMP, 0, 4);
+my $MONTH     = substr($RUN_STAMP, 4, 2);
 
-my %group_path = (
-    note => "note/$year/$month/$stamp.txt",
-    todo => "todo/$year/$month/$stamp.txt",
-    evnt => "evnt/$year/$month/$stamp.txt",
+my %TYPE_DIR = (
+    note => "note",
+    todo => "todo",
+    evnt => "evnt",
 );
 
+my %conf = read_arkrc(".arkrc");
+
+my $REPO        = $conf{repo}     || $conf{repo_id} || basename_abs(".");
+my $AUTHOUR     = $conf{authour}  || "";
+my $ASSIGNEE    = $conf{assignee} || "";
+my $DEFAULT_TAG = $conf{tag}      || "general";
+
+$REPO =~ s/[^A-Za-z0-9_-]//g;
+$REPO ||= "ark";
+
 my %grouped;
-my @delete;
+my @delete_files;
+my %rewrite_files;
 my $note_counter = 0;
 
-sub ignored_path {
-    my ($p) = @_;
+my $SHOW_PROGRESS = -t STDERR && !$ENV{ARK_NO_PROGRESS};
+my $last_progress_pct = -1;
 
-    return 1 if $p =~ m{(^|/)_};
-    return 1 if $p =~ m{^\./?(note|todo|evnt)(/|$)};
-    return 1 if $p =~ m{^\./?\.git(/|$)};
-    return 1 if $p =~ m{^\./?tidy_loose_txt\.pl$};
+sub progress {
+    my ($label, $done, $total) = @_;
+    return unless $SHOW_PROGRESS;
+    return unless $total;
 
-    return 0;
+    my $pct = int(($done / $total) * 100);
+    return if $pct == $last_progress_pct;
+    return if $pct % 5 != 0 && $pct != 100;
+
+    $last_progress_pct = $pct;
+    print STDERR "$label $pct%\n";
+}
+
+sub progress_reset {
+    $last_progress_pct = -1;
+}
+
+sub basename_abs {
+    my $cwd = `pwd`;
+    chomp $cwd;
+    return basename($cwd);
+}
+
+sub read_arkrc {
+    my ($path) = @_;
+    my %c;
+    return %c unless -f $path;
+
+    open my $fh, "<:encoding(UTF-8)", $path or return %c;
+
+    my $section = "";
+
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/\r$//;
+
+        next if $line =~ /^\s*$/;
+
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            $section = lc $1;
+            next;
+        }
+
+        next unless $section eq "defaults";
+
+        if ($line =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/) {
+            $c{$1} = $2;
+        }
+        elsif ($line =~ /^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$/) {
+            $c{$1} = $2;
+        }
+    }
+
+    close $fh;
+    return %c;
 }
 
 sub slurp {
     my ($p) = @_;
-    open my $fh, "<:encoding(UTF-8)", $p or return;
+    open my $fh, "<:encoding(UTF-8)", $p or return undef;
     local $/;
     return <$fh>;
 }
 
-sub write_append {
+sub write_file {
     my ($p, $txt) = @_;
     make_path(dirname($p));
-    open my $fh, ">>:encoding(UTF-8)", $p or die "write $p: $!";
+    open my $fh, ">:encoding(UTF-8)", $p or die "write $p: $!";
     print $fh $txt;
     close $fh;
 }
 
-sub unique_note_path {
-    my $base = "note/$year/$month/$stamp.txt";
-    return $base unless -e $base;
+sub append_file {
+    my ($p, $txt) = @_;
+    make_path(dirname($p));
+    open my $fh, ">>:encoding(UTF-8)", $p or die "append $p: $!";
+    print $fh $txt;
+    close $fh;
+}
 
-    $note_counter++;
-    my $suffix = sprintf("%03d", $note_counter);
-    return "note/$year/$month/${stamp}_$suffix.txt";
+sub random_hex {
+    my ($n) = @_;
+    open my $fh, "<", "/dev/urandom" or die "cannot read /dev/urandom: $!";
+    read $fh, my $bytes, int(($n + 1) / 2);
+    close $fh;
+    return substr(unpack("H*", $bytes), 0, $n);
+}
+
+sub new_id {
+    return "id/" . $REPO . $DATE_ID . random_hex(12);
+}
+
+sub unique_path {
+    my ($path) = @_;
+    return $path unless -e $path;
+
+    my $dir  = dirname($path);
+    my $file = basename($path);
+    my ($stem, $ext) = $file =~ /^(.*?)(\.[^.]+)?$/;
+    $ext //= "";
+
+    for my $i (1..9999) {
+        my $candidate = sprintf "%s/%s_%03d%s", $dir, $stem, $i, $ext;
+        return $candidate unless -e $candidate;
+    }
+
+    die "could not create unique path for $path";
+}
+
+sub slug {
+    my ($s) = @_;
+    $s //= "";
+    $s = lc $s;
+    $s =~ s/^\s+|\s+$//g;
+    $s =~ s/[^a-z0-9]+/-/g;
+    $s =~ s/^-+|-+$//g;
+    $s ||= $RUN_STAMP;
+    return substr($s, 0, 80);
+}
+
+sub ignored_for_level2_move {
+    my ($p) = @_;
+    return 1 if $p =~ m{^\./?\.git(/|$)};
+    return 1 if $p =~ m{^\./?(note|todo|evnt)/\d{4}/\d{2}/};
+    return 1 if $p =~ m{^\./?tidy(?:\.pl|_loose_txt\.pl)?$};
+    return 0;
+}
+
+sub protected_underscore_file {
+    my ($p) = @_;
+    return basename($p) =~ /^_/;
+}
+
+sub trim {
+    my ($s) = @_;
+    $s //= "";
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
+}
+
+sub parse_meta {
+    my ($meta) = @_;
+    my @tokens;
+    return @tokens unless defined $meta && length $meta;
+
+    for my $tok (split /\s*;\s*/, $meta) {
+        $tok = trim($tok);
+        push @tokens, $tok if length $tok;
+    }
+
+    return @tokens;
+}
+
+sub split_content_meta {
+    my ($raw) = @_;
+    $raw = trim($raw);
+
+    my $meta = "";
+
+    if ($raw =~ s/\{([^}]*)\}//s) {
+        $meta = $1;
+    }
+
+    $raw = trim($raw);
+    return ($raw, $meta);
+}
+
+sub token_kind {
+    my ($tok) = @_;
+    return "title"    if $tok =~ m{^/};
+    return "tag"      if $tok =~ /^#/;
+    return "status"   if $tok =~ /^=/;
+    return "authour"  if $tok =~ /^\$/;
+    return "assignee" if $tok =~ /^\@/;
+    return "priority" if $tok =~ /^!/;
+    return "deadline" if $tok =~ /^%/;
+    return "start"    if $tok =~ /^>/;
+    return "end"      if $tok =~ /^</;
+    return "repeat"   if $tok =~ /^\^/;
+    return "created"  if $tok =~ /^~/;
+    return "id"       if $tok =~ m{^id/};
+    return "other";
+}
+
+sub has_kind {
+    my ($tokens, $kind) = @_;
+    for my $t (@$tokens) {
+        return 1 if token_kind($t) eq $kind;
+    }
+    return 0;
+}
+
+sub order_meta {
+    my (@tokens) = @_;
+
+    my %rank = (
+        title    => 1,
+        tag      => 2,
+        status   => 3,
+        authour  => 4,
+        assignee => 5,
+        priority => 6,
+        deadline => 7,
+        start    => 8,
+        end      => 9,
+        repeat   => 10,
+        created  => 11,
+        id       => 12,
+        other    => 99,
+    );
+
+    return sort {
+        ($rank{token_kind($a)} || 99) <=> ($rank{token_kind($b)} || 99)
+            || $a cmp $b
+    } @tokens;
+}
+
+sub is_multiline_content {
+    my ($content) = @_;
+    return $content =~ /\n/;
+}
+
+sub normalise_record {
+    my ($type, $content, $meta) = @_;
+
+    $content = trim($content);
+
+    my @tokens = parse_meta($meta);
+
+    push @tokens, "~$RUN_STAMP" unless has_kind(\@tokens, "created");
+    push @tokens, new_id()      unless has_kind(\@tokens, "id");
+
+    push @tokens, "\$$AUTHOUR"    if $AUTHOUR && !has_kind(\@tokens, "authour");
+    push @tokens, "#$DEFAULT_TAG" unless has_kind(\@tokens, "tag");
+
+    if ($type eq "todo") {
+        push @tokens, "=todo" unless has_kind(\@tokens, "status");
+        push @tokens, "\@$ASSIGNEE" if $ASSIGNEE && !has_kind(\@tokens, "assignee");
+    }
+
+    @tokens = order_meta(@tokens);
+
+    my $meta_txt = join "; ", @tokens;
+
+    if ($type eq "note" && is_multiline_content($content)) {
+        return "$type: {$meta_txt}\n\n$content\n\n;;";
+    }
+
+    return "$type: $content {$meta_txt};;";
+}
+
+sub extract_title {
+    my ($record) = @_;
+
+    if ($record =~ /\{([^}]*)\}/s) {
+        my @tokens = parse_meta($1);
+        for my $t (@tokens) {
+            return substr($t, 1) if $t =~ m{^/(.+)};
+        }
+    }
+
+    return "";
 }
 
 sub is_single_line_note {
-    my ($block) = @_;
+    my ($record) = @_;
 
-    my $tmp = $block;
-    $tmp =~ s/^\s*note:\s*//s;
-    $tmp =~ s/;;\s*$//s;
-    $tmp =~ s/^\s+|\s+$//g;
+    return 0 unless $record =~ /^\s*note:/;
 
-    return $tmp !~ /\n/;
+    my $raw = $record;
+    $raw =~ s/^\s*note:\s*//s;
+    $raw =~ s/\s*;;\s*$//s;
+
+    my ($content, undef) = split_content_meta($raw);
+
+    return $content !~ /\n/;
 }
 
-sub strip_found_blocks {
-    my ($txt) = @_;
-    $txt =~ s/(?:^|\n)\s*(?:note|todo|evnt)\s*:\s*.*?;;//sg;
-    $txt =~ s/^\s+|\s+$//g;
-    return $txt;
+sub output_batch_path {
+    my ($type) = @_;
+    return unique_path("$TYPE_DIR{$type}/$YEAR/$MONTH/$RUN_STAMP.txt");
 }
 
-find({
-    no_chdir => 1,
-    wanted => sub {
-        my $p = $File::Find::name;
-        return unless -f $p;
-        return unless $p =~ /\.txt$/;
-        return if ignored_path($p);
+sub output_multiline_note_path {
+    my ($record) = @_;
 
-        my $txt = slurp($p);
-        return unless defined $txt;
+    my $title = extract_title($record);
+    my $name = $title ? slug($title) : sprintf("%s_%03d", $RUN_STAMP, ++$note_counter);
 
-        my $found = 0;
+    return unique_path("note/$YEAR/$MONTH/$name.txt");
+}
 
-        while ($txt =~ /((?:^|\n)\s*(note|todo|evnt)\s*:\s*.*?;;)/sg) {
-            my ($block, $type) = ($1, $2);
+sub process_file {
+    my ($p, $move_out) = @_;
 
-            $block =~ s/^\n//;
-            $block =~ s/^\s+|\s+$//g;
+    my $txt = slurp($p);
+    return unless defined $txt;
 
-            next unless length $block;
+    my $found   = 0;
+    my $new_txt = "";
+    my $pos     = 0;
 
-            if ($type eq "note" && !is_single_line_note($block)) {
-                my $dst = unique_note_path();
+    while ($txt =~ /((?:^|\n)\s*(note|todo|evnt)\s*:\s*(.*?)\s*;;)/sg) {
+        my ($whole, $type, $raw) = ($1, $2, $3);
+        my $start = $-[1];
+        my $end   = $+[1];
+
+        $new_txt .= substr($txt, $pos, $start - $pos);
+
+        my ($content, $meta) = split_content_meta($raw);
+        my $record = normalise_record($type, $content, $meta);
+
+        $found++;
+
+        if ($move_out) {
+            if ($type eq "note" && !is_single_line_note($record)) {
+                my $dst = output_multiline_note_path($record);
                 print "note: $p -> $dst\n";
-                write_append($dst, "$block\n") if $APPLY;
+                append_file($dst, "$record\n") if $APPLY;
             } else {
-                push @{$grouped{$type}}, "$block\n\n";
+                push @{$grouped{$type}}, "$record\n\n";
             }
-
-            $found++;
+        } else {
+            $new_txt .= "$record\n";
         }
 
-        if ($found) {
-            my $leftover = strip_found_blocks($txt);
+        $pos = $end;
+    }
 
-            if (length $leftover) {
-                warn "not deleting $p: contains non-record text\n";
-            } else {
-                push @delete, $p;
+    return unless $found;
+
+    $new_txt .= substr($txt, $pos);
+
+    if ($move_out) {
+        my $left = trim($new_txt);
+
+        if (length $left) {
+            $rewrite_files{$p} = "$left\n";
+            warn "rewriting $p: non-record text remains\n";
+        } else {
+            push @delete_files, $p;
+        }
+    } else {
+        $rewrite_files{$p} = $new_txt;
+    }
+
+    print "found $found record(s) in $p\n";
+}
+
+sub run_tidy {
+    my @files;
+
+    if ($ALL) {
+        find({
+            no_chdir => 1,
+            wanted => sub {
+                my $p = $File::Find::name;
+                return unless -f $p;
+                return unless $p =~ /\.txt$/;
+                return if ignored_for_level2_move($p);
+                push @files, $p;
             }
+        }, ".");
+    } else {
+        push @files, "inbox.txt" if -f "inbox.txt";
+    }
 
-            print "found $found record(s) in $p\n";
+    my $total = scalar @files;
+    my $done = 0;
+    progress_reset();
+
+    for my $p (@files) {
+        $done++;
+        progress("tidying", $done, $total);
+
+        my $move_out = $ALL && protected_underscore_file($p) ? 0 : 1;
+        process_file($p, $move_out);
+    }
+
+    for my $type (qw(note todo evnt)) {
+        next unless $grouped{$type};
+
+        my $dst = output_batch_path($type);
+        my $txt = join "", @{$grouped{$type}};
+
+        print "$type: grouped -> $dst\n";
+        append_file($dst, $txt) if $APPLY;
+    }
+
+    if ($APPLY) {
+        for my $p (sort keys %rewrite_files) {
+            write_file($p, $rewrite_files{$p});
+        }
+
+        for my $p (@delete_files) {
+            unlink $p or warn "could not delete $p: $!\n";
         }
     }
-}, ".");
-
-for my $type (qw(note todo evnt)) {
-    next unless $grouped{$type};
-
-    my $dst = $group_path{$type};
-    my $txt = join "", @{$grouped{$type}};
-
-    print "$type: grouped -> $dst\n";
-    write_append($dst, $txt) if $APPLY;
 }
+
+sub record_is_multiline_note {
+    my ($record) = @_;
+    return 0 unless $record =~ /^\s*note:/;
+    return !is_single_line_note($record);
+}
+
+sub created_of {
+    my ($r) = @_;
+    return $1 if $r =~ /(?:^|[{\s;])~([0-9T]+)/;
+    return "";
+}
+
+sub compact_type_month {
+    my ($type, $year, $month) = @_;
+
+    my $dir = "$TYPE_DIR{$type}/$year/$month";
+    return unless -d $dir;
+
+    my @records;
+    my @old_files;
+
+    opendir my $dh, $dir or return;
+    my @files = sort grep { /\.txt$/ } readdir $dh;
+    closedir $dh;
+
+    for my $file (@files) {
+        my $path = "$dir/$file";
+        next unless -f $path;
+
+        my $txt = slurp($path);
+        next unless defined $txt;
+
+        my @found = $txt =~ /(\s*$type\s*:\s*.*?;;)/sg;
+        next unless @found;
+
+        my $only_records = $txt;
+        $only_records =~ s/\s*$type\s*:\s*.*?;;//sg;
+        $only_records = trim($only_records);
+        next if length $only_records;
+
+        my $has_multiline = 0;
+
+        for my $r (@found) {
+            $r = trim($r);
+
+            if ($type eq "note" && record_is_multiline_note($r)) {
+                $has_multiline = 1;
+                last;
+            }
+        }
+
+        next if $has_multiline;
+
+        push @records, map { trim($_) } @found;
+        push @old_files, $path;
+    }
+
+    return unless @records;
+
+    @records = sort {
+        created_of($a) cmp created_of($b)
+            || $a cmp $b
+    } @records;
+
+    my $chunk = 1;
+    my $count = 0;
+    my $out = "";
+
+    for my $r (@records) {
+        $out .= "$r\n";
+        $count++;
+
+        if ($count >= 1000) {
+            my $path = sprintf "%s/%s_%s%s_%03d.txt", $dir, $type, $year, $month, $chunk++;
+            print "compact: $path\n";
+            write_file($path, $out) if $APPLY;
+            $out = "";
+            $count = 0;
+        }
+    }
+
+    if (length $out) {
+        my $path = sprintf "%s/%s_%s%s_%03d.txt", $dir, $type, $year, $month, $chunk++;
+        print "compact: $path\n";
+        write_file($path, $out) if $APPLY;
+    }
+
+    if ($APPLY) {
+        for my $p (@old_files) {
+            next if $p =~ m{/$type\_${year}${month}_\d{3}\.txt$};
+            unlink $p or warn "could not remove old compact source $p: $!\n";
+        }
+    }
+}
+
+sub run_compact {
+    my @months;
+
+    for my $type (qw(note todo evnt)) {
+        my $root = $TYPE_DIR{$type};
+        next unless -d $root;
+
+        find({
+            no_chdir => 1,
+            wanted => sub {
+                my $p = $File::Find::name;
+                return unless -d $p;
+
+                if ($p =~ m{^(?:\./)?$root/(\d{4})/(\d{2})$}) {
+                    push @months, [$type, $1, $2];
+                }
+            }
+        }, $root);
+    }
+
+    my $total = scalar @months;
+    my $done = 0;
+    progress_reset();
+
+    for my $m (@months) {
+        $done++;
+        progress("compacting", $done, $total);
+        compact_type_month(@$m);
+    }
+}
+
+run_tidy();
+run_compact() if $COMPACT;
 
 if ($APPLY) {
-    for my $p (@delete) {
-        unlink $p or warn "could not delete $p: $!\n";
-    }
-
     print "\nApplied tidy.\n";
-    print "deleted source file(s): " . scalar(@delete) . "\n";
+    print "deleted source file(s): " . scalar(@delete_files) . "\n";
 } else {
     print "\nDry run only. Run with --apply to write files.\n";
 }
