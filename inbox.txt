@@ -1,0 +1,54 @@
+todo: check if clash between aliases and commands;;
+todo: have option to choose meta in output;;
+todo: add delete/archive functionality;;
+todo: add automatic metadata properties? requires reserving some (status, creation, tag, priority, deadline);;
+todo: allow any value to be used as metadata with :;;
+todo: add warnings for missing/invalid fields - maybe even collect a report?;;
+todo: issue of duplicates? when grouping? say items are grouped, but non-ark-text in source file, so it isn't deleted. then user deletes non-ark-text, re-tidies - there will be duplicates. how does one avoid?
+todo: add like stats and stuff
+todo: * is every file constantly being touched by tidy --compact a good idea? should some files be left alone? is that even what is happening?
+todo: what happens if two metadata blocks are returned?
+todo: in edit/glance mode, put numbers at beginning of item on same level - not above
+todo: when using glance as a search item in ark, does it sometimes mistake it for the command?
+todo: ensure loading bars for tidy scripts - for everything
+note: 
+
+incorporate following where relevant
+
+x reading of routine events? that requires some extra logic (static files or no?)
+x being able to batch modify and edit quickly? how?
+-- edit content??
+-- commands which execute on tidy - such as priority and deadline updates 
+x update querier to allow to search for items with property by including no value ('evnt, -^')
+xx allow sorting by property symbol with no value - basically allow all operations to use no value with symbol
+-- allow queries which are like 'before, after, equal to', as well as comparisons
+c have filenames change to titles? - no
+- add creation back to those missing files which don't have it
+- see all values of a property
+x possibility to string multiple queries together
+x a report function which allows selection, and then adds to a file?
+x add commas to meta
+- comments 
+- squash outputs with no blank lines?
+x add calendar
+- fix blank spaces in reports behaviour
+- somehow make reports smaller?
+- bring ids back???
+
+x bring creation back? so creation allows queries based on time? (new query logic needed) also, keeps atomic structure
+- publishing script
+x collaborations? or reading from other places: demarcate clearly
+- somehow get a project focus list
+
+- issue: priority decay is important - but quick edit may help
+- issue: what about authorship? just keep it manual?
+- possible issue: what happens when you edit a routine in edit mode?
+
+- in future:
+-- validation script to check parsing
+-- validation script for building db (closer to old org now)
+--- need priority decay here
+-- allow query script to read from db if existing
+-- add to tidy sorting of lines so that we don't get lots of todo or event files with one or two lines
+
+;;
