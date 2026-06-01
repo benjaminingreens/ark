@@ -20,7 +20,9 @@ my @BASES = @{$CONFIG{bases}};
 my @records;
 my @query_warnings;
 
-my $SHOW_PROGRESS = -t STDERR && !$ENV{ARK_NO_PROGRESS};
+my $SHOW_PROGRESS = -t STDERR
+    && !$ENV{ARK_NO_PROGRESS}
+    && (($ENV{TERM} // "") ne "dumb");
 my $last_progress_pct = -1;
 my $shown_count = 0;
 my $NEEDS_LEADING_BLANK = 0;
@@ -272,14 +274,25 @@ sub progress {
     return unless $total;
 
     my $pct = int(($done / $total) * 100);
-    return if $pct == 0;
     return if $pct == $last_progress_pct;
-    return if $pct % 5 != 0 && $pct != 100;
-
-    print STDERR "\n" if $last_progress_pct == -1;
 
     $last_progress_pct = $pct;
-    print STDERR "scanning $pct%\n";
+
+    my $term_width = width();
+
+    # "scanning [] 100%" is about 16 chars, plus margin
+    my $bar_width = $term_width - 20;
+    $bar_width = 10 if $bar_width < 10;
+    $bar_width = 50 if $bar_width > 50;
+
+    my $filled = int(($pct / 100) * $bar_width);
+    my $bar = ("#" x $filled) . ("-" x ($bar_width - $filled));
+
+    print STDERR "\rscanning [$bar] $pct%";
+
+    if ($pct >= 100) {
+        print STDERR "\n";
+    }
 }
 
 sub progress_done {
