@@ -741,10 +741,23 @@ sub generate_instances_for_date {
     my @t = localtime($target_epoch);
     my $target_day_start = date_start_epoch($t[5] + 1900, $t[4] + 1, $t[3]);
 
-    my $candidate = $target_day_start + ($start_hour * 3600) + ($start_min * 60);
+    my $has_date_selector = grep { $_ !~ /^(h|n)/ } @selectors;
 
-    if (ymd_key_from_epoch($ps) le $target_key) {
-        push @cands, $candidate;
+    if ($has_date_selector) {
+        my $candidate = $target_day_start + ($start_hour * 3600) + ($start_min * 60);
+
+        if (ymd_key_from_epoch($ps) le $target_key) {
+            push @cands, $candidate;
+        }
+    } else {
+        my @p = localtime($ps);
+        my $candidate = date_start_epoch($p[5] + 1900, $p[4] + 1, $p[3])
+            + ($start_hour * 3600)
+            + ($start_min * 60);
+
+        if (ymd_key_from_epoch($candidate) eq $target_key) {
+            push @cands, $candidate;
+        }
     }
 
     @cands = grep {
