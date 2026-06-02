@@ -1,14 +1,14 @@
 # Ark
 
-install/update v0.1.0-alpha.12
+install/update v0.1.0-alpha.13
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.12/install.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.13/install.sh)"
 ```
 
-install/update v0.1.0-alpha.12 on ish:
+install/update v0.1.0-alpha.13 on ish:
 ```bash
 apk add perl git curl
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.12/install.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.13/install.sh)"
 ```
 
 Ark is a plain-text terminal organiser for notes, todos, and events.

@@ -54,9 +54,27 @@ sub cmd_init {
         print $fh ".\n\n";
 
         print $fh "[defaults]\n";
-        print $fh "# authour=\n";
-        print $fh "# assignee=\n";
-        print $fh "tag=general\n";
+        print $fh "authour=\n";
+        print $fh "assignee=\n";
+        print $fh "tag=general\n\n";
+
+        print $fh "[queries]\n";
+
+        print $fh "normalise =\n";
+        print $fh "  edit 'todo, -=todo, !=1, --%' set '%+2w'\n";
+        print $fh "  ;; edit 'todo, -=todo, !=2, --%' set '%+4w'\n";
+        print $fh "  ;; edit 'todo, -=todo, !>1, %>=today, %<+2w' set '!1'\n";
+        print $fh "  ;; edit 'todo, -=todo, !>2, %>=+2w, %<=+4w' set '!2'\n";
+        print $fh "  ;; edit 'todo, -=todo, !<2, %>=-4w, %<=-2w' set '!2'\n";
+        print $fh "  ;; edit 'todo, -=todo, !<3, %<-4w' set '!3'\n\n";
+
+        print $fh "report =\n";
+        print $fh "  evnt, week, --^, >>\n";
+        print $fh "  ;; evnt, today, -^, >>\n";
+        print $fh "  ;; glance 'todo, -=todo, (-!1|-!2), >!'\n";
+        print $fh "  ;; glance 'newest(todo, -=todo, -!3; 2)'\n";
+        print $fh "  ;; glance 'oldest(todo, -=todo, -!3; 2)'\n";
+        print $fh "  ;; glance 'random(todo, -=todo, -!3; 2)'\n";
 
         close $fh;
     }
@@ -136,11 +154,19 @@ sub load_arkrc {
     my $section = "";
     my $inline_name = "";
     my $inline_code = "";
+    my $query_name = "";
 
     while (my $line = <$fh>) {
         chomp $line;
 
+        if ($section eq "queries" && $query_name && $line =~ /^\s+(.+)$/) {
+            $config{queries}{$query_name} .= " " . trim($1);
+            next;
+        }
+
         if ($line =~ /^\s*\[(.+)\]\s*$/) {
+            $query_name = "";
+
             if ($section eq "function" && length $inline_code) {
                 push @{$config{inline_functions}}, {
                     name => $inline_name,
@@ -181,9 +207,11 @@ sub load_arkrc {
         }
         elsif ($section eq "queries") {
             my ($name, $query) = split /\s*=\s*/, $line, 2;
-            next unless $name && $query;
+            next unless $name;
+            $query //= "";
 
             $config{queries}{$name} = $query;
+            $query_name = $name;
         }
     }
 
@@ -314,6 +342,23 @@ sub confirm {
 # DATE HELPERS
 # ============================================================
 
+sub relative_date_value {
+    my ($s) = @_;
+    $s = trim($s // "");
+
+    my $base = today_start_epoch();
+
+    return ymd_key_from_epoch($base) if $s eq "today";
+
+    if ($s =~ /^([+-])(\d+)([ymwd])$/) {
+        my ($sign, $n, $u) = ($1, int($2), $3);
+        $n *= -1 if $sign eq "-";
+        return ymd_key_from_epoch(add_interval($base, $n, $u));
+    }
+
+    return $s;
+}
+
 sub today_ymd {
     my @t = localtime;
     return sprintf("%04d%02d%02d", $t[5] + 1900, $t[4] + 1, $t[3]);
@@ -434,7 +479,7 @@ sub add_calendar_days {
         my $dim = days_in_month($y, $m);
         if ($d + $n <= $dim) {
             $d += $n;
-            last;
+            return ($y, $m, $d);
         }
         $n -= ($dim - $d + 1);
         $d = 1;
@@ -443,6 +488,20 @@ sub add_calendar_days {
             $m = 1;
             $y++;
         }
+    }
+
+    while ($n < 0) {
+        if ($d + $n >= 1) {
+            $d += $n;
+            return ($y, $m, $d);
+        }
+        $n += $d;
+        $m--;
+        if ($m < 1) {
+            $m = 12;
+            $y--;
+        }
+        $d = days_in_month($y, $m);
     }
 
     return ($y, $m, $d);
@@ -1142,6 +1201,8 @@ sub matches_comparison {
     my $actual = meta_value($r, $sym);
     return 0 unless defined $actual && length $actual;
 
+    $wanted = relative_date_value($wanted) if $sym eq "%";
+
     my $cmp;
 
     if ($sym eq "!") {
@@ -1364,6 +1425,8 @@ sub update_block_meta {
 sub edited_block {
     my ($r, $op, @args) = @_;
 
+    @args = map { expand_dynamic_edit_token($_) } @args;
+
     my @meta = map { { %$_ } } @{$r->{meta}};
     my $meta_ref = \@meta;
 
@@ -1463,6 +1526,15 @@ sub run_query_action {
 
     if ($action =~ /^glance\s+(.+)$/s) {
         cmd_glance(strip_query_quotes($1));
+        return;
+    }
+
+    if ($action =~ /^edit\s+('.*?'|\S+)\s+(add|remove|set|replace|a|r|s|p)\s+(.+)$/s) {
+        my ($query, $op, $args) = ($1, $2, $3);
+        $query = strip_query_quotes($query);
+        my @args = map { strip_query_quotes($_) } split /\s+/, trim($args);
+        cmd_edit_batch($query, $op, @args);
+        load_records();
         return;
     }
 
@@ -1593,6 +1665,16 @@ sub parse_operation_line {
 
     my ($op, @args) = split /\s+/, $line;
     return ($op, @args);
+}
+
+sub expand_dynamic_edit_token {
+    my ($tok) = @_;
+
+    if ($tok =~ /^%(.+)$/) {
+        return "%" . relative_date_value($1);
+    }
+
+    return $tok;
 }
 
 sub cmd_edit_batch {
@@ -1759,6 +1841,32 @@ sub load_query_functions {
     }
 }
 
+sub expand_query_actions {
+    my ($text, $seen_ref) = @_;
+    $seen_ref ||= {};
+
+    $text = trim($text);
+
+    if (exists $CONFIG{queries}{$text}) {
+        die "Query alias loop involving '$text'\n" if $seen_ref->{$text}++;
+        return expand_query_actions($CONFIG{queries}{$text}, $seen_ref);
+    }
+
+    my @out;
+
+    for my $part (grep { length trim($_) } split /\s*;;\s*/, $text) {
+        $part = trim($part);
+
+        if (exists $CONFIG{queries}{$part}) {
+            push @out, expand_query_actions($CONFIG{queries}{$part}, { %$seen_ref });
+        } else {
+            push @out, $part;
+        }
+    }
+
+    return @out;
+}
+
 sub resolve_query_alias {
     my ($q) = @_;
 
@@ -1915,8 +2023,7 @@ if (!@ARGV) {
 my @queries = @ARGV;
 
 for my $qi (0 .. $#queries) {
-    my $expanded = resolve_query_alias($queries[$qi]);
-    my @actions = grep { length trim($_) } split /\s*;;\s*/, $expanded;
+    my @actions = expand_query_actions($queries[$qi]);
 
     for my $ai (0 .. $#actions) {
         print "\n" if $qi > 0 || $ai > 0;
