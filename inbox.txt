@@ -12,7 +12,11 @@ todo: in edit/glance mode, put numbers at beginning of item on same level - not 
 todo: when using glance as a search item in ark, does it sometimes mistake it for the command?
 todo: ensure loading bars for tidy scripts - for everything
 todo: rjo repo notes not organising into relevant folders
-todo: date as an argument in ark
+todo: date as an argument in ark when querying events - allow for views up to a date for example, or on a date
+todo: allow modification based on id?
+todo: make id collision impossible
+todo: what to do about clashes between query aliases and search terms
+todo: somehow automatically run edit and normalise views before report?
 note: 
 
 incorporate following where relevant
