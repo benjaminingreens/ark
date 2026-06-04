@@ -17,9 +17,7 @@ my %conf = read_arkrc(".arkrc");
 my @publish_tags = @{ $conf{publish_tags} || [] };
 my $no_publish = norm_tag($conf{defaults}{no_publish} // "no_publish");
 
-if (!@publish_tags) {
-    die "No [publish] tags found in .arkrc\n";
-}
+die "No [publish] tags found in .arkrc\n" unless @publish_tags;
 
 my $template = read_template();
 my @notes = scan_notes();
@@ -97,9 +95,11 @@ sub read_arkrc {
         }
         elsif ($section eq "publish") {
             my $tag = $line;
+
             if ($tag =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/) {
                 $tag = length($2) ? $2 : $1;
             }
+
             $tag = norm_tag($tag);
             push @{ $c{publish_tags} }, $tag if length $tag;
         }
@@ -124,10 +124,12 @@ sub read_arkrc {
 sub expand_base_path {
     my ($path) = @_;
     $path = trim($path);
+
     if ($path =~ /^~(?=\/|$)/) {
         my $home = $ENV{HOME} || (getpwuid($<))[7] || ".";
         $path =~ s/^~/$home/;
     }
+
     return $path;
 }
 
@@ -139,6 +141,7 @@ sub read_template {
 
     my $cmd_path = abs_path($0) || $0;
     my $cmd_dir = dirname($cmd_path);
+
     push @paths, "$cmd_dir/../templates/publish.html";
     push @paths, "$ENV{HOME}/.local/lib/ark/templates/publish.html" if $ENV{HOME};
     push @paths, "/usr/local/lib/ark/templates/publish.html";
@@ -146,10 +149,12 @@ sub read_template {
 
     for my $p (@paths) {
         next unless defined $p && -f $p;
+
         open my $fh, "<:encoding(UTF-8)", $p or next;
         local $/;
         my $txt = <$fh>;
         close $fh;
+
         dbg("template=$p");
         return $txt;
     }
@@ -169,9 +174,17 @@ sub default_template {
 </head>
 <body>
 <main class="content">
-<nav class="topnav"><a href="{{asset_prefix}}index.html">Home</a></nav>
+<nav class="topbar" id="topbar">{{breadcrumb}}</nav>
 {{content}}
 </main>
+<script>
+window.addEventListener("load", function () {
+  var bar = document.getElementById("topbar");
+  if (bar) {
+    bar.scrollLeft = bar.scrollWidth;
+  }
+});
+</script>
 </body>
 </html>
 HTML
@@ -183,6 +196,7 @@ sub scan_notes {
     for my $base (@{ $conf{bases} }) {
         my $root = "$base/note";
         next unless -d $root;
+
         find({
             no_chdir => 1,
             wanted => sub {
@@ -196,6 +210,7 @@ sub scan_notes {
     }
 
     my @notes;
+
     for my $file (sort @files) {
         open my $fh, "<:encoding(UTF-8)", $file or next;
         local $/;
@@ -205,6 +220,7 @@ sub scan_notes {
         while ($text =~ /((?:^|\n)\s*note\s*:\s*.*?;;)/sg) {
             my $raw = $1;
             my $entry = $raw;
+
             $entry =~ s/^\s*note\s*:\s*//s;
             $entry =~ s/;;\s*$//s;
             $entry = trim($entry);
@@ -249,14 +265,22 @@ sub parse_meta {
 
     for my $tok (split /\s*;\s*/, trim($raw)) {
         next unless length $tok;
+
         my ($sym, $val);
+
         if ($tok =~ /^id\/(.+)/) {
             ($sym, $val) = ("id/", $1);
-        } else {
+        }
+        else {
             $sym = substr($tok, 0, 1);
             $val = substr($tok, 1);
         }
-        push @items, { raw => $tok, sym => $sym, val => $val };
+
+        push @items, {
+            raw => $tok,
+            sym => $sym,
+            val => $val,
+        };
     }
 
     return @items;
@@ -264,20 +288,24 @@ sub parse_meta {
 
 sub meta_value {
     my ($meta, $sym) = @_;
+
     for my $m (@$meta) {
         return $m->{val} if $m->{sym} eq $sym;
     }
+
     return "";
 }
 
 sub note_title {
     my ($body, $meta, $file) = @_;
+
     my $t = meta_value($meta, "/");
     return clean_title($t) if length trim($t);
 
     for my $line (split /\n/, $body) {
         $line = trim($line);
         next unless length $line;
+
         $line =~ s/^#+\s*//;
         return clean_title($line);
     }
@@ -285,64 +313,71 @@ sub note_title {
     my $base = basename($file);
     $base =~ s/\.txt$//;
     $base =~ s/[-_]+/ /g;
+
     return clean_title($base || "Untitled");
 }
 
 sub clean_title {
     my ($s) = @_;
+
     $s = trim($s);
     $s =~ s/\s+/ /g;
+
     return $s || "Untitled";
 }
 
 sub rel_path {
     my ($p) = @_;
+
     $p =~ s{^\./}{};
+
     my $cwd = getcwd();
     my $abs = abs_path($p);
+
     if ($abs && index($abs, "$cwd/") == 0) {
         return substr($abs, length($cwd) + 1);
     }
+
     return $p;
 }
 
 sub note_output_path {
     my ($rel, $id) = @_;
+
     my $stem = $id || $rel;
+
     $stem =~ s/^&//;
     $stem =~ s/^id\///;
     $stem = slug($stem);
     $stem ||= slug($rel);
+
     return "notes/$stem.html";
 }
 
 sub write_note_page {
     my ($r) = @_;
+
     my $out = "$DOCS_DIR/$r->{out}";
     make_path(dirname($out));
 
-    my $tags = join " ", map {
-        '<a href="../' . url_escape($_) . '/index.html">#' . html($_) . '</a>'
-    } grep { $_ ne "publish" } @{ $r->{tags} };
-
-    my $meta = '<details class="meta"><summary>Details</summary>'
-             . '<dl>'
-             . '<dt>Path</dt><dd>' . html($r->{path}) . '</dd>'
-             . '<dt>Tags</dt><dd>' . ($tags || '-') . '</dd>';
-    $meta .= '<dt>Created</dt><dd>' . html($r->{date}) . '</dd>' if length $r->{date};
-    $meta .= '</dl></details>';
-
     my $content = '<article class="note">'
-                . '<h1>' . html($r->{title}) . '</h1>'
-                . $meta
                 . markdown_to_html($r->{body})
                 . '</article>';
 
-    write_file($out, render_page($r->{title}, $content, "../"));
+    my $crumb_tag = first_publish_tag($r) || "notes";
+
+    my $breadcrumb = breadcrumb_html(
+        ["../index.html", repo_name()],
+        ["../" . url_escape($crumb_tag) . "/index.html", $crumb_tag],
+        ["../$r->{out}", $r->{title}],
+    );
+
+    write_file($out, render_page($r->{title}, $content, "../", $breadcrumb));
 }
 
 sub write_tag_home {
     my ($tag, $items) = @_;
+
     my $dir = "$DOCS_DIR/$tag";
     make_path($dir);
 
@@ -352,36 +387,63 @@ sub write_tag_home {
 
     my $content = '<section class="tag-home">'
                 . '<h1>' . html($tag) . '</h1>'
-                . '<ul class="note-list">';
+                . '<nav class="link-list">';
 
     for my $r (@sorted) {
         my $href = "../$r->{out}";
-        $content .= '<li><a href="' . html($href) . '">' . html($r->{title}) . '</a></li>';
+        $content .= '<a href="' . html($href) . '">' . html($r->{title}) . '</a>';
     }
 
-    $content .= '</ul></section>';
-    write_file("$dir/index.html", render_page($tag, $content, "../"));
+    $content .= '</nav></section>';
+
+    my $breadcrumb = breadcrumb_html(
+        ["../index.html", repo_name()],
+        ["../" . url_escape($tag) . "/index.html", $tag],
+    );
+
+    write_file("$dir/index.html", render_page($tag, $content, "../", $breadcrumb));
 }
 
 sub write_site_index {
-    my $content = '<section class="site-home"><h1>Ark</h1><ul class="tag-list">';
+    my $repo = repo_name();
+
+    my $content = '<section class="site-home">'
+                . '<h1>' . html($repo) . '</h1>'
+                . '<nav class="link-list">';
 
     for my $tag (@publish_tags) {
         my $count = scalar @{ $selected_by_tag{$tag} || [] };
         next unless $count;
-        $content .= '<li><a href="' . html(url_escape($tag)) . '/index.html">' . html($tag) . '</a> <span class="count">' . $count . '</span></li>';
+
+        $content .= '<a href="' . html(url_escape($tag)) . '/index.html">'
+                 . html($tag)
+                 . ' <span class="count">'
+                 . $count
+                 . '</span></a>';
     }
 
-    $content .= '</ul></section>';
-    write_file("$DOCS_DIR/index.html", render_page("Ark", $content, ""));
+    $content .= '</nav></section>';
+
+    my $breadcrumb = breadcrumb_html(
+        ["index.html", $repo],
+        ["index.html", "*select a tag...*"],
+    );
+
+    write_file("$DOCS_DIR/index.html", render_page($repo, $content, "", $breadcrumb));
 }
 
 sub render_page {
-    my ($title, $content, $asset_prefix) = @_;
+    my ($title, $content, $asset_prefix, $breadcrumb) = @_;
+
+    $breadcrumb //= breadcrumb_html(["index.html", repo_name()]);
+
     my $html = $template;
+
     $html =~ s/\{\{title\}\}/html($title)/ge;
     $html =~ s/\{\{content\}\}/$content/g;
     $html =~ s/\{\{asset_prefix\}\}/$asset_prefix/g;
+    $html =~ s/\{\{breadcrumb\}\}/$breadcrumb/g;
+
     return $html;
 }
 
@@ -392,122 +454,360 @@ sub write_asset_css {
 
 sub default_css {
     return <<'CSS';
-html { box-sizing: border-box; }
-*, *::before, *::after { box-sizing: inherit; }
+html {
+  box-sizing: border-box;
+}
+
+*, *::before, *::after {
+  box-sizing: inherit;
+}
+
 body {
   margin: 0;
-  padding: 18px 20px 40px;
+  padding: 20px 20px 40px;
   background: #000;
   color: #fff;
   font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 19px;
   line-height: 1.65;
 }
+
 .content {
   width: 100%;
   max-width: 760px;
   margin: 0 auto;
 }
-a { color: inherit; text-decoration: underline; }
-a:hover { text-decoration: none; }
-h1, h2, h3 { line-height: 1.2; margin: 0 0 0.7em; }
-p { margin: 0 0 0.7em; }
-ul, ol { margin: 0 0 0.8em; padding-left: 1.4em; }
-li { margin: 0.15em 0; }
-pre, code { white-space: pre-wrap; overflow-wrap: anywhere; }
-blockquote { border-left: 2px solid #555; margin: 1em 0; padding-left: 1em; color: #ddd; }
-.topnav { margin-bottom: 1.5em; font-size: 0.8em; color: #bbb; }
-.meta {
-  margin: 0.5em 0 1.5em;
-  font-size: 0.75em;
-  color: #bbb;
+
+a {
+  color: inherit;
+  text-decoration: underline;
 }
-.meta summary { cursor: pointer; width: fit-content; }
-.meta dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2em 0.8em; margin: 0.7em 0 0; }
-.meta dt { color: #888; }
-.meta dd { margin: 0; overflow-wrap: anywhere; }
-.note-list, .tag-list { list-style: none; padding-left: 0; }
-.note-list li::before, .tag-list li::before { content: "* "; color: #888; }
-.count { color: #888; font-size: 0.8em; }
-.content, .content * { overflow-wrap: anywhere; word-break: break-word; }
+
+a:hover {
+  text-decoration: none;
+}
+
+h1, h2, h3 {
+  line-height: 1.2;
+  margin: 0 0 0.7em;
+}
+
+p {
+  margin: 0 0 0.7em;
+}
+
+.note p,
+.note li,
+.note blockquote {
+  text-align: left;
+  max-width: 66ch;
+}
+
+.note p {
+  text-align: left;
+  hyphens: none;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+ul, ol {
+  margin: 0 0 0.8em 0;
+  padding-left: 0;
+}
+
+ul {
+  list-style: none;
+}
+
+ul li {
+  padding-left: 1.4em;
+  text-indent: -1.4em;
+}
+
+ul li::before {
+  content: "* ";
+}
+
+ol {
+  margin: 0 0 0.8em 0;
+  padding-left: 2.4em;
+  list-style-position: outside;
+}
+
+ol li {
+  margin: 0.15em 0;
+  padding-left: 0.2em;
+  text-indent: 0;
+}
+
+ol li::before {
+  content: none;
+}
+
+li {
+  margin: 0.15em 0;
+}
+
+.topbar {
+  width: 100%;
+  margin: 0 0 2.2em 0;
+  padding: 0;
+  background: #000;
+  color: #bbb;
+
+  font-size: 1em;
+  line-height: 1.65;
+  font-style: italic;
+
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+
+  text-align: left;
+}
+
+.crumb-inner {
+  display: inline-block;
+}
+
+.topbar a {
+  display: inline-block;
+  color: inherit;
+  text-decoration: underline;
+}
+
+.topbar a:hover {
+  text-decoration: none;
+}
+
+.topbar .sep {
+  display: inline-block;
+  color: #666;
+  padding: 0 0.55em;
+}
+
+.link-list {
+  display: block;
+  margin: 0;
+  padding: 0;
+}
+
+.link-list a {
+  display: block;
+  padding-left: 1.5em;
+  text-indent: -1.5em;
+  margin: 0.2em 0;
+}
+
+.count {
+  color: #888;
+  font-size: 0.8em;
+  text-decoration: none;
+}
+
+.note p,
+.note li,
+.note blockquote {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
 @media (min-width: 768px) {
-  body { padding-top: 32px; font-size: 21px; }
-  .content { max-width: 900px; }
+  body {
+    font-size: 21px;
+    padding-top: 72px;
+  }
+
+  .content {
+    max-width: 900px;
+  }
+
+  .topbar {
+    margin-bottom: 3em;
+  }
 }
 CSS
 }
 
+sub repo_name {
+    my $cwd = getcwd();
+    return basename($cwd) || "ark";
+}
+
+sub first_publish_tag {
+    my ($r) = @_;
+    my %wanted = map { $_ => 1 } @publish_tags;
+
+    for my $t (@{ $r->{tags} }) {
+        return $t if $wanted{$t};
+    }
+
+    return "";
+}
+
+sub breadcrumb_html {
+    my (@parts) = @_;
+
+    return "" unless @parts;
+
+    my @out;
+
+    for my $p (@parts) {
+        my ($href, $label) = @$p;
+        push @out, '<a href="' . html($href) . '">' . html($label) . '</a>';
+    }
+
+    return '<span class="crumb-inner">'
+         . join('<span class="sep">&gt;</span>', @out)
+         . '</span>';
+}
+
 sub markdown_to_html {
     my ($md) = @_;
+
     my @lines = split /\n/, $md;
     my $out = "";
     my $in_ul = 0;
     my $in_ol = 0;
     my $in_p = 0;
 
-    my $close_p = sub { if ($in_p) { $out .= "</p>\n"; $in_p = 0; } };
-    my $close_ul = sub { if ($in_ul) { $out .= "</ul>\n"; $in_ul = 0; } };
-    my $close_ol = sub { if ($in_ol) { $out .= "</ol>\n"; $in_ol = 0; } };
+    my $close_p = sub {
+        if ($in_p) {
+            $out .= "</p>\n";
+            $in_p = 0;
+        }
+    };
+
+    my $close_ul = sub {
+        if ($in_ul) {
+            $out .= "</ul>\n";
+            $in_ul = 0;
+        }
+    };
+
+    my $close_ol = sub {
+        if ($in_ol) {
+            $out .= "</ol>\n";
+            $in_ol = 0;
+        }
+    };
 
     for my $line (@lines) {
         $line =~ s/\r$//;
 
         if ($line =~ /^\s*$/) {
-            $close_p->(); $close_ul->(); $close_ol->();
+            $close_p->();
+            $close_ul->();
+            $close_ol->();
             next;
         }
 
         if ($line =~ /^(#{1,3})\s+(.+)$/) {
-            $close_p->(); $close_ul->(); $close_ol->();
+            $close_p->();
+            $close_ul->();
+            $close_ol->();
+
             my $level = length($1);
             $out .= "<h$level>" . inline($2) . "</h$level>\n";
             next;
         }
 
         if ($line =~ /^\s*[-*]\s+(.+)$/) {
-            $close_p->(); $close_ol->();
-            if (!$in_ul) { $out .= "<ul>\n"; $in_ul = 1; }
+            $close_p->();
+            $close_ol->();
+
+            if (!$in_ul) {
+                $out .= "<ul>\n";
+                $in_ul = 1;
+            }
+
             $out .= "<li>" . inline($1) . "</li>\n";
             next;
         }
 
+        # Escaped numbered-list marker: 1\. text
+        # Render as plain paragraph text: 1. text
+        if ($line =~ /^\s*(\d+)\\\.\s+(.+)$/) {
+            $close_ul->();
+            $close_ol->();
+
+            if (!$in_p) {
+                $out .= "<p>";
+                $in_p = 1;
+            }
+            else {
+                $out .= "<br>";
+            }
+
+            $out .= inline("$1. $2");
+            next;
+        }
+
         if ($line =~ /^\s*\d+\.\s+(.+)$/) {
-            $close_p->(); $close_ul->();
-            if (!$in_ol) { $out .= "<ol>\n"; $in_ol = 1; }
+            $close_p->();
+            $close_ul->();
+
+            if (!$in_ol) {
+                $out .= "<ol>\n";
+                $in_ol = 1;
+            }
+
             $out .= "<li>" . inline($1) . "</li>\n";
             next;
         }
 
         if ($line =~ /^>\s?(.*)$/) {
-            $close_p->(); $close_ul->(); $close_ol->();
+            $close_p->();
+            $close_ul->();
+            $close_ol->();
+
             $out .= "<blockquote>" . inline($1) . "</blockquote>\n";
             next;
         }
 
-        $close_ul->(); $close_ol->();
-        if (!$in_p) { $out .= "<p>"; $in_p = 1; }
-        else { $out .= "<br>"; }
+        $close_ul->();
+        $close_ol->();
+
+        if (!$in_p) {
+            $out .= "<p>";
+            $in_p = 1;
+        }
+        else {
+            $out .= "<br>";
+        }
+
         $out .= inline($line);
     }
 
-    $close_p->(); $close_ul->(); $close_ol->();
+    $close_p->();
+    $close_ul->();
+    $close_ol->();
+
     return $out;
 }
 
 sub inline {
     my ($s) = @_;
+
     $s = html($s);
+
+    $s =~ s/\\([\\`*_{}\[\]()#+\-.!])/$1/g;
+
     $s =~ s/\[([^\]]+)\]\(([^)]+)\)/'<a href="' . html($2) . '">' . html($1) . '<\/a>'/ge;
     $s =~ s/\*\*([^*]+)\*\*/<strong>$1<\/strong>/g;
     $s =~ s/__([^_]+)__/<strong>$1<\/strong>/g;
     $s =~ s/\*([^*]+)\*/<em>$1<\/em>/g;
     $s =~ s/_([^_]+)_/<em>$1<\/em>/g;
+
     return $s;
 }
 
 sub write_file {
     my ($p, $txt) = @_;
+
     make_path(dirname($p));
+
     open my $fh, ">:encoding(UTF-8)", $p or die "Cannot write $p: $!\n";
     print $fh $txt;
     close $fh;
@@ -515,26 +815,32 @@ sub write_file {
 
 sub trim {
     my ($s) = @_;
+
     $s //= "";
     $s =~ s/^\s+|\s+$//g;
+
     return $s;
 }
 
 sub norm_tag {
     my ($s) = @_;
+
     $s = trim($s // "");
     $s =~ s/^#//;
     $s = lc $s;
     $s =~ s/[^a-z0-9_-]+/-/g;
     $s =~ s/^-+|-+$//g;
+
     return $s;
 }
 
 sub slug {
     my ($s) = @_;
+
     $s = lc($s // "");
     $s =~ s/[^a-z0-9_-]+/-/g;
     $s =~ s/^-+|-+$//g;
+
     return substr($s, 0, 120);
 }
 
@@ -545,11 +851,13 @@ sub url_escape {
 
 sub html {
     my ($s) = @_;
+
     $s //= "";
     $s =~ s/&/&amp;/g;
     $s =~ s/</&lt;/g;
     $s =~ s/>/&gt;/g;
     $s =~ s/"/&quot;/g;
     $s =~ s/'/&#39;/g;
+
     return $s;
 }
