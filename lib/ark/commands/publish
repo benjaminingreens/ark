@@ -1,0 +1,555 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use utf8;
+use File::Find;
+use File::Path qw(make_path remove_tree);
+use File::Basename qw(dirname basename);
+use Cwd qw(abs_path getcwd);
+
+binmode(STDOUT, ":encoding(UTF-8)");
+binmode(STDERR, ":encoding(UTF-8)");
+
+my $DOCS_DIR = "docs";
+my $DEBUG = grep { $_ eq "--debug" } @ARGV;
+
+my %conf = read_arkrc(".arkrc");
+my @publish_tags = @{ $conf{publish_tags} || [] };
+my $no_publish = norm_tag($conf{defaults}{no_publish} // "no_publish");
+
+if (!@publish_tags) {
+    die "No [publish] tags found in .arkrc\n";
+}
+
+my $template = read_template();
+my @notes = scan_notes();
+my %selected_by_tag;
+my %published_pages;
+
+for my $r (@notes) {
+    next if $no_publish ne "" && $r->{tagset}{$no_publish};
+
+    for my $tag (@publish_tags) {
+        next unless $r->{tagset}{$tag};
+        push @{ $selected_by_tag{$tag} }, $r;
+        $published_pages{$r->{path}} = $r;
+    }
+}
+
+if (-d $DOCS_DIR) {
+    remove_tree($DOCS_DIR) or die "Cannot remove $DOCS_DIR: $!\n";
+}
+make_path($DOCS_DIR);
+
+write_asset_css();
+
+for my $path (sort keys %published_pages) {
+    write_note_page($published_pages{$path});
+}
+
+for my $tag (@publish_tags) {
+    write_tag_home($tag, $selected_by_tag{$tag} || []);
+}
+
+write_site_index();
+
+my $note_count = scalar keys %published_pages;
+my $tag_count = scalar grep { @{ $selected_by_tag{$_} || [] } } @publish_tags;
+print "Published $note_count note(s) across $tag_count tag homepage(s) to $DOCS_DIR/\n";
+
+sub dbg {
+    return unless $DEBUG;
+    print STDERR "[publish] ", @_, "\n";
+}
+
+sub read_arkrc {
+    my ($path) = @_;
+    my %c = (
+        defaults => {},
+        publish_tags => [],
+        bases => ["."],
+    );
+
+    return %c unless -f $path;
+
+    open my $fh, "<:encoding(UTF-8)", $path or die "Cannot read $path: $!\n";
+    my $section = "";
+
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/\r$//;
+        next if $line =~ /^\s*$/;
+
+        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
+            $section = lc trim($1);
+            next;
+        }
+
+        next if $line =~ /^\s*#/;
+
+        if ($section eq "defaults") {
+            if ($line =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/) {
+                $c{defaults}{$1} = $2;
+            }
+            elsif ($line =~ /^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$/) {
+                $c{defaults}{$1} = $2;
+            }
+        }
+        elsif ($section eq "publish") {
+            my $tag = $line;
+            if ($tag =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/) {
+                $tag = length($2) ? $2 : $1;
+            }
+            $tag = norm_tag($tag);
+            push @{ $c{publish_tags} }, $tag if length $tag;
+        }
+        elsif ($section eq "bases") {
+            my $base = trim($line);
+            push @{ $c{bases} }, expand_base_path($base) if length $base;
+        }
+    }
+
+    close $fh;
+
+    if (@{ $c{bases} } > 1 && $c{bases}[0] eq ".") {
+        shift @{ $c{bases} };
+    }
+
+    my %seen;
+    @{ $c{publish_tags} } = grep { !$seen{$_}++ } @{ $c{publish_tags} };
+
+    return %c;
+}
+
+sub expand_base_path {
+    my ($path) = @_;
+    $path = trim($path);
+    if ($path =~ /^~(?=\/|$)/) {
+        my $home = $ENV{HOME} || (getpwuid($<))[7] || ".";
+        $path =~ s/^~/$home/;
+    }
+    return $path;
+}
+
+sub read_template {
+    my @paths;
+
+    push @paths, $ENV{ARK_PUBLISH_TEMPLATE} if $ENV{ARK_PUBLISH_TEMPLATE};
+    push @paths, ".ark/publish.html";
+
+    my $cmd_path = abs_path($0) || $0;
+    my $cmd_dir = dirname($cmd_path);
+    push @paths, "$cmd_dir/../templates/publish.html";
+    push @paths, "$ENV{HOME}/.local/lib/ark/templates/publish.html" if $ENV{HOME};
+    push @paths, "/usr/local/lib/ark/templates/publish.html";
+    push @paths, "/usr/lib/ark/templates/publish.html";
+
+    for my $p (@paths) {
+        next unless defined $p && -f $p;
+        open my $fh, "<:encoding(UTF-8)", $p or next;
+        local $/;
+        my $txt = <$fh>;
+        close $fh;
+        dbg("template=$p");
+        return $txt;
+    }
+
+    return default_template();
+}
+
+sub default_template {
+    return <<'HTML';
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{title}}</title>
+<link rel="stylesheet" href="{{asset_prefix}}assets/publish.css">
+</head>
+<body>
+<main class="content">
+<nav class="topnav"><a href="{{asset_prefix}}index.html">Home</a></nav>
+{{content}}
+</main>
+</body>
+</html>
+HTML
+}
+
+sub scan_notes {
+    my @files;
+
+    for my $base (@{ $conf{bases} }) {
+        my $root = "$base/note";
+        next unless -d $root;
+        find({
+            no_chdir => 1,
+            wanted => sub {
+                my $p = $File::Find::name;
+                return unless -f $p;
+                return unless $p =~ /\.txt$/;
+                return if $p =~ m{/(?:docs|\.git)/};
+                push @files, $p;
+            },
+        }, $root);
+    }
+
+    my @notes;
+    for my $file (sort @files) {
+        open my $fh, "<:encoding(UTF-8)", $file or next;
+        local $/;
+        my $text = <$fh>;
+        close $fh;
+
+        while ($text =~ /((?:^|\n)\s*note\s*:\s*.*?;;)/sg) {
+            my $raw = $1;
+            my $entry = $raw;
+            $entry =~ s/^\s*note\s*:\s*//s;
+            $entry =~ s/;;\s*$//s;
+            $entry = trim($entry);
+
+            my $meta_raw = "";
+            if ($entry =~ s/\{([^{}]*)\}//s) {
+                $meta_raw = $1;
+            }
+
+            my $body = trim($entry);
+            my @meta = parse_meta($meta_raw);
+            my @tags = grep { length } map { norm_tag($_->{val}) } grep { $_->{sym} eq "#" } @meta;
+            my %tagset = map { $_ => 1 } @tags;
+            my $title = note_title($body, \@meta, $file);
+            my $rel = rel_path($file);
+            my $id = meta_value(\@meta, "&") || meta_value(\@meta, "id/") || $rel;
+            my $date = meta_value(\@meta, "~");
+
+            push @notes, {
+                path => $rel,
+                file => $file,
+                raw => $raw,
+                body => $body,
+                meta => \@meta,
+                tags => \@tags,
+                tagset => \%tagset,
+                title => $title,
+                id => $id,
+                date => $date,
+                out => note_output_path($rel, $id),
+            };
+        }
+    }
+
+    return @notes;
+}
+
+sub parse_meta {
+    my ($raw) = @_;
+    my @items;
+    return @items unless defined $raw;
+
+    for my $tok (split /\s*;\s*/, trim($raw)) {
+        next unless length $tok;
+        my ($sym, $val);
+        if ($tok =~ /^id\/(.+)/) {
+            ($sym, $val) = ("id/", $1);
+        } else {
+            $sym = substr($tok, 0, 1);
+            $val = substr($tok, 1);
+        }
+        push @items, { raw => $tok, sym => $sym, val => $val };
+    }
+
+    return @items;
+}
+
+sub meta_value {
+    my ($meta, $sym) = @_;
+    for my $m (@$meta) {
+        return $m->{val} if $m->{sym} eq $sym;
+    }
+    return "";
+}
+
+sub note_title {
+    my ($body, $meta, $file) = @_;
+    my $t = meta_value($meta, "/");
+    return clean_title($t) if length trim($t);
+
+    for my $line (split /\n/, $body) {
+        $line = trim($line);
+        next unless length $line;
+        $line =~ s/^#+\s*//;
+        return clean_title($line);
+    }
+
+    my $base = basename($file);
+    $base =~ s/\.txt$//;
+    $base =~ s/[-_]+/ /g;
+    return clean_title($base || "Untitled");
+}
+
+sub clean_title {
+    my ($s) = @_;
+    $s = trim($s);
+    $s =~ s/\s+/ /g;
+    return $s || "Untitled";
+}
+
+sub rel_path {
+    my ($p) = @_;
+    $p =~ s{^\./}{};
+    my $cwd = getcwd();
+    my $abs = abs_path($p);
+    if ($abs && index($abs, "$cwd/") == 0) {
+        return substr($abs, length($cwd) + 1);
+    }
+    return $p;
+}
+
+sub note_output_path {
+    my ($rel, $id) = @_;
+    my $stem = $id || $rel;
+    $stem =~ s/^&//;
+    $stem =~ s/^id\///;
+    $stem = slug($stem);
+    $stem ||= slug($rel);
+    return "notes/$stem.html";
+}
+
+sub write_note_page {
+    my ($r) = @_;
+    my $out = "$DOCS_DIR/$r->{out}";
+    make_path(dirname($out));
+
+    my $tags = join " ", map {
+        '<a href="../' . url_escape($_) . '/index.html">#' . html($_) . '</a>'
+    } grep { $_ ne "publish" } @{ $r->{tags} };
+
+    my $meta = '<details class="meta"><summary>Details</summary>'
+             . '<dl>'
+             . '<dt>Path</dt><dd>' . html($r->{path}) . '</dd>'
+             . '<dt>Tags</dt><dd>' . ($tags || '-') . '</dd>';
+    $meta .= '<dt>Created</dt><dd>' . html($r->{date}) . '</dd>' if length $r->{date};
+    $meta .= '</dl></details>';
+
+    my $content = '<article class="note">'
+                . '<h1>' . html($r->{title}) . '</h1>'
+                . $meta
+                . markdown_to_html($r->{body})
+                . '</article>';
+
+    write_file($out, render_page($r->{title}, $content, "../"));
+}
+
+sub write_tag_home {
+    my ($tag, $items) = @_;
+    my $dir = "$DOCS_DIR/$tag";
+    make_path($dir);
+
+    my @sorted = sort {
+        lc($a->{title}) cmp lc($b->{title}) || $a->{path} cmp $b->{path}
+    } @$items;
+
+    my $content = '<section class="tag-home">'
+                . '<h1>' . html($tag) . '</h1>'
+                . '<ul class="note-list">';
+
+    for my $r (@sorted) {
+        my $href = "../$r->{out}";
+        $content .= '<li><a href="' . html($href) . '">' . html($r->{title}) . '</a></li>';
+    }
+
+    $content .= '</ul></section>';
+    write_file("$dir/index.html", render_page($tag, $content, "../"));
+}
+
+sub write_site_index {
+    my $content = '<section class="site-home"><h1>Ark</h1><ul class="tag-list">';
+
+    for my $tag (@publish_tags) {
+        my $count = scalar @{ $selected_by_tag{$tag} || [] };
+        next unless $count;
+        $content .= '<li><a href="' . html(url_escape($tag)) . '/index.html">' . html($tag) . '</a> <span class="count">' . $count . '</span></li>';
+    }
+
+    $content .= '</ul></section>';
+    write_file("$DOCS_DIR/index.html", render_page("Ark", $content, ""));
+}
+
+sub render_page {
+    my ($title, $content, $asset_prefix) = @_;
+    my $html = $template;
+    $html =~ s/\{\{title\}\}/html($title)/ge;
+    $html =~ s/\{\{content\}\}/$content/g;
+    $html =~ s/\{\{asset_prefix\}\}/$asset_prefix/g;
+    return $html;
+}
+
+sub write_asset_css {
+    make_path("$DOCS_DIR/assets");
+    write_file("$DOCS_DIR/assets/publish.css", default_css());
+}
+
+sub default_css {
+    return <<'CSS';
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  margin: 0;
+  padding: 18px 20px 40px;
+  background: #000;
+  color: #fff;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 19px;
+  line-height: 1.65;
+}
+.content {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+}
+a { color: inherit; text-decoration: underline; }
+a:hover { text-decoration: none; }
+h1, h2, h3 { line-height: 1.2; margin: 0 0 0.7em; }
+p { margin: 0 0 0.7em; }
+ul, ol { margin: 0 0 0.8em; padding-left: 1.4em; }
+li { margin: 0.15em 0; }
+pre, code { white-space: pre-wrap; overflow-wrap: anywhere; }
+blockquote { border-left: 2px solid #555; margin: 1em 0; padding-left: 1em; color: #ddd; }
+.topnav { margin-bottom: 1.5em; font-size: 0.8em; color: #bbb; }
+.meta {
+  margin: 0.5em 0 1.5em;
+  font-size: 0.75em;
+  color: #bbb;
+}
+.meta summary { cursor: pointer; width: fit-content; }
+.meta dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2em 0.8em; margin: 0.7em 0 0; }
+.meta dt { color: #888; }
+.meta dd { margin: 0; overflow-wrap: anywhere; }
+.note-list, .tag-list { list-style: none; padding-left: 0; }
+.note-list li::before, .tag-list li::before { content: "* "; color: #888; }
+.count { color: #888; font-size: 0.8em; }
+.content, .content * { overflow-wrap: anywhere; word-break: break-word; }
+@media (min-width: 768px) {
+  body { padding-top: 32px; font-size: 21px; }
+  .content { max-width: 900px; }
+}
+CSS
+}
+
+sub markdown_to_html {
+    my ($md) = @_;
+    my @lines = split /\n/, $md;
+    my $out = "";
+    my $in_ul = 0;
+    my $in_ol = 0;
+    my $in_p = 0;
+
+    my $close_p = sub { if ($in_p) { $out .= "</p>\n"; $in_p = 0; } };
+    my $close_ul = sub { if ($in_ul) { $out .= "</ul>\n"; $in_ul = 0; } };
+    my $close_ol = sub { if ($in_ol) { $out .= "</ol>\n"; $in_ol = 0; } };
+
+    for my $line (@lines) {
+        $line =~ s/\r$//;
+
+        if ($line =~ /^\s*$/) {
+            $close_p->(); $close_ul->(); $close_ol->();
+            next;
+        }
+
+        if ($line =~ /^(#{1,3})\s+(.+)$/) {
+            $close_p->(); $close_ul->(); $close_ol->();
+            my $level = length($1);
+            $out .= "<h$level>" . inline($2) . "</h$level>\n";
+            next;
+        }
+
+        if ($line =~ /^\s*[-*]\s+(.+)$/) {
+            $close_p->(); $close_ol->();
+            if (!$in_ul) { $out .= "<ul>\n"; $in_ul = 1; }
+            $out .= "<li>" . inline($1) . "</li>\n";
+            next;
+        }
+
+        if ($line =~ /^\s*\d+\.\s+(.+)$/) {
+            $close_p->(); $close_ul->();
+            if (!$in_ol) { $out .= "<ol>\n"; $in_ol = 1; }
+            $out .= "<li>" . inline($1) . "</li>\n";
+            next;
+        }
+
+        if ($line =~ /^>\s?(.*)$/) {
+            $close_p->(); $close_ul->(); $close_ol->();
+            $out .= "<blockquote>" . inline($1) . "</blockquote>\n";
+            next;
+        }
+
+        $close_ul->(); $close_ol->();
+        if (!$in_p) { $out .= "<p>"; $in_p = 1; }
+        else { $out .= "<br>"; }
+        $out .= inline($line);
+    }
+
+    $close_p->(); $close_ul->(); $close_ol->();
+    return $out;
+}
+
+sub inline {
+    my ($s) = @_;
+    $s = html($s);
+    $s =~ s/\[([^\]]+)\]\(([^)]+)\)/'<a href="' . html($2) . '">' . html($1) . '<\/a>'/ge;
+    $s =~ s/\*\*([^*]+)\*\*/<strong>$1<\/strong>/g;
+    $s =~ s/__([^_]+)__/<strong>$1<\/strong>/g;
+    $s =~ s/\*([^*]+)\*/<em>$1<\/em>/g;
+    $s =~ s/_([^_]+)_/<em>$1<\/em>/g;
+    return $s;
+}
+
+sub write_file {
+    my ($p, $txt) = @_;
+    make_path(dirname($p));
+    open my $fh, ">:encoding(UTF-8)", $p or die "Cannot write $p: $!\n";
+    print $fh $txt;
+    close $fh;
+}
+
+sub trim {
+    my ($s) = @_;
+    $s //= "";
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
+}
+
+sub norm_tag {
+    my ($s) = @_;
+    $s = trim($s // "");
+    $s =~ s/^#//;
+    $s = lc $s;
+    $s =~ s/[^a-z0-9_-]+/-/g;
+    $s =~ s/^-+|-+$//g;
+    return $s;
+}
+
+sub slug {
+    my ($s) = @_;
+    $s = lc($s // "");
+    $s =~ s/[^a-z0-9_-]+/-/g;
+    $s =~ s/^-+|-+$//g;
+    return substr($s, 0, 120);
+}
+
+sub url_escape {
+    my ($s) = @_;
+    return slug($s);
+}
+
+sub html {
+    my ($s) = @_;
+    $s //= "";
+    $s =~ s/&/&amp;/g;
+    $s =~ s/</&lt;/g;
+    $s =~ s/>/&gt;/g;
+    $s =~ s/"/&quot;/g;
+    $s =~ s/'/&#39;/g;
+    return $s;
+}
