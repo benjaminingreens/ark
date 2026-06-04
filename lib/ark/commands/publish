@@ -426,7 +426,7 @@ sub write_site_index {
 
     my $breadcrumb = breadcrumb_html(
         ["index.html", $repo],
-        ["index.html", "*select a tag...*"],
+        ["index.html", "select a tag..."],
     );
 
     write_file("$DOCS_DIR/index.html", render_page($repo, $content, "", $breadcrumb));
