@@ -492,8 +492,16 @@ h1, h2, h3 {
   margin: 0 0 0.7em;
 }
 
+.note h1 {
+  margin: 0 0 1.6em 0 !important;
+}
+
+.note h1 + * {
+  margin-top: 0 !important;
+}
+
 p {
-  margin: 0 0 0.7em;
+  margin: 0 0 1.2em;
 }
 
 .note p,
@@ -508,6 +516,7 @@ p {
   hyphens: none;
   overflow-wrap: normal;
   word-break: normal;
+  margin: 0 0 1.4em 0;
 }
 
 ul, ol {
@@ -727,20 +736,13 @@ sub markdown_to_html {
         }
 
         # Escaped numbered-list marker: 1\. text
-        # Render as plain paragraph text: 1. text
+        # Render as its own paragraph: 1. text
         if ($line =~ /^\s*(\d+)\\\.\s+(.+)$/) {
             $close_ul->();
             $close_ol->();
-
-            if (!$in_p) {
-                $out .= "<p>";
-                $in_p = 1;
-            }
-            else {
-                $out .= "<br>";
-            }
-
-            $out .= inline("$1. $2");
+            $close_p->();
+        
+            $out .= "<p>" . inline("$1. $2") . "</p>\n";
             next;
         }
 
