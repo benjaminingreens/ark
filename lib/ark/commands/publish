@@ -456,6 +456,7 @@ sub default_css {
     return <<'CSS';
 html {
   box-sizing: border-box;
+  background: #000;
 }
 
 *, *::before, *::after {
@@ -464,7 +465,7 @@ html {
 
 body {
   margin: 0;
-  padding: 20px 20px 40px;
+  padding: 32px 20px 56px;
   background: #000;
   color: #fff;
   font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -478,6 +479,8 @@ body {
   margin: 0 auto;
 }
 
+/* Links */
+
 a {
   color: inherit;
   text-decoration: underline;
@@ -487,51 +490,101 @@ a:hover {
   text-decoration: none;
 }
 
-h1, h2, h3 {
+/* Top navigation */
+
+.topbar {
+  width: 100%;
+  margin: 0 0 48px;
+  padding: 0;
+  color: #bbb;
+  font-size: 1em;
+  line-height: 1.65;
+  font-style: italic;
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.crumb-inner {
+  display: inline-block;
+}
+
+.topbar a {
+  display: inline-block;
+}
+
+.topbar .sep {
+  display: inline-block;
+  color: #666;
+  padding: 0 0.55em;
+}
+
+/* Main content */
+
+.note,
+.site-home,
+.tag-home {
+  width: 100%;
+}
+
+/* Headings */
+
+h1,
+h2,
+h3 {
   line-height: 1.2;
+  font-weight: 700;
 }
 
 h1 {
-  margin: 0 0 0.7em;
-}
-
-.note h1 {
-  margin: 0 0 1em 0 !important;
-}
-
-.note h1 + * {
-  margin-top: 0 !important;
+  margin: 0 0 32px;
 }
 
 h2 {
-  margin: 2.4em 0 0.9em;
+  margin: 56px 0 20px;
 }
 
 h3 {
-  margin: 2em 0 0.8em;
+  margin: 44px 0 16px;
 }
 
-p {
-  margin: 0 0 1.2em;
+h1 + h2,
+h2 + h3 {
+  margin-top: 0;
+}
+
+/* Text */
+
+p,
+blockquote,
+ul,
+ol {
+  margin-top: 0;
+  margin-bottom: 26px;
+}
+
+p:last-child,
+blockquote:last-child,
+ul:last-child,
+ol:last-child {
+  margin-bottom: 0;
 }
 
 .note p,
 .note li,
 .note blockquote {
-  text-align: left;
   max-width: 66ch;
-}
-
-.note p {
   text-align: left;
   hyphens: none;
   overflow-wrap: normal;
   word-break: normal;
-  margin: 0 0 1.4em 0;
 }
 
-ul, ol {
-  margin: 0 0 0.8em 0;
+/* Lists */
+
+ul,
+ol {
   padding-left: 0;
 }
 
@@ -549,13 +602,11 @@ ul li::before {
 }
 
 ol {
-  margin: 0 0 0.8em 0;
   padding-left: 2.4em;
   list-style-position: outside;
 }
 
 ol li {
-  margin: 0.15em 0;
   padding-left: 0.2em;
   text-indent: 0;
 }
@@ -565,47 +616,10 @@ ol li::before {
 }
 
 li {
-  margin: 0.15em 0;
+  margin: 6px 0;
 }
 
-.topbar {
-  width: 100%;
-  margin: 0 0 2.2em 0;
-  padding: 0;
-  background: #000;
-  color: #bbb;
-
-  font-size: 1em;
-  line-height: 1.65;
-  font-style: italic;
-
-  white-space: nowrap;
-  overflow-x: auto;
-  overflow-y: hidden;
-  -webkit-overflow-scrolling: touch;
-
-  text-align: left;
-}
-
-.crumb-inner {
-  display: inline-block;
-}
-
-.topbar a {
-  display: inline-block;
-  color: inherit;
-  text-decoration: underline;
-}
-
-.topbar a:hover {
-  text-decoration: none;
-}
-
-.topbar .sep {
-  display: inline-block;
-  color: #666;
-  padding: 0 0.55em;
-}
+/* Link list pages */
 
 .link-list {
   display: block;
@@ -615,9 +629,9 @@ li {
 
 .link-list a {
   display: block;
+  margin: 8px 0;
   padding-left: 1.5em;
   text-indent: -1.5em;
-  margin: 0.2em 0;
 }
 
 .count {
@@ -626,25 +640,16 @@ li {
   text-decoration: none;
 }
 
-.note p,
-.note li,
-.note blockquote {
-  overflow-wrap: normal;
-  word-break: normal;
-}
+/* Desktop */
 
 @media (min-width: 768px) {
   body {
+    padding: 32px 32px 72px;
     font-size: 21px;
-    padding-top: 72px;
   }
 
   .content {
     max-width: 900px;
-  }
-
-  .topbar {
-    margin-bottom: 3em;
   }
 }
 CSS
