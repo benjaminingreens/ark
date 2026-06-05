@@ -489,15 +489,26 @@ a:hover {
 
 h1, h2, h3 {
   line-height: 1.2;
+}
+
+h1 {
   margin: 0 0 0.7em;
 }
 
 .note h1 {
-  margin: 0 0 1.6em 0 !important;
+  margin: 0 0 1em 0 !important;
 }
 
 .note h1 + * {
   margin-top: 0 !important;
+}
+
+h2 {
+  margin: 2.4em 0 0.9em;
+}
+
+h3 {
+  margin: 2em 0 0.8em;
 }
 
 p {
