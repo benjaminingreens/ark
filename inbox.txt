@@ -19,6 +19,7 @@ todo: what to do about clashes between query aliases and search terms
 todo: somehow automatically run edit and normalise views before report?
 todo: fix numbered lists and scroll right on topbar in publish script
 todo: different output types for queries - default should be ugly and pipeable, then allow for 'prettier' outputs
+todo: the tidy script doesnt seem to be organising by creation for every note
 note: 
 
 incorporate following where relevant
