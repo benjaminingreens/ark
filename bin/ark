@@ -26,6 +26,9 @@ my $SHOW_PROGRESS = -t STDERR
 my $last_progress_pct = -1;
 my $shown_count = 0;
 my $NEEDS_LEADING_BLANK = 0;
+my $OUTPUT_MODE = "pipe"; # pipe | basic | compact
+my $OUTPUT_WRAP = 0;
+my $OUTPUT_NO_AUTOWRAP = 0;
 
 # ============================================================
 # BASIC HELPERS
@@ -319,7 +322,7 @@ sub progress {
     print STDERR "\rscanning [$bar] $pct%";
 
     if ($pct >= 100) {
-        print STDERR "\n";
+        print STDERR "\n\n";
     }
 }
 
@@ -1550,13 +1553,7 @@ sub run_query_action {
     @records = @base_records;
     print_query_warnings();
 
-    print "$query\n\n";
-    print scalar(@out) . " result(s)\n\n";
-
-    for my $i (0 .. $#out) {
-        show($out[$i]);
-        print "\n" if $i < $#out;
-    }
+    print_query_results($query, \@out, "result");
 }
 
 sub cmd_glance {
@@ -1567,29 +1564,18 @@ sub cmd_glance {
 
     my @matches = query_records($query);
 
-    print STDERR "\n$query\n\n";
-    print STDERR scalar(@matches) . " result(s)\n\n";
+    print_query_header($query, scalar(@matches), "result", *STDERR);
 
     return unless @matches;
 
     my $i = 1;
     for my $r (@matches) {
-        print STDERR "\n[$i]\n";
+        show_numbered_line($i, $r, *STDERR);
 
-        my $meta = display_meta($r);
-        my $body = $r->{content};
+        print STDERR "\n"
+            if $OUTPUT_MODE eq "basic"
+            && $i < @matches;
 
-        if ($r->{type} eq "note") {
-            $body =~ s/\s+/ /g;
-            $body = substr($body, 0, 160) . "..." if length($body) > 160;
-        }
-
-        my $line = $r->{type} . ":";
-        $line .= " " . trim($body) if length trim($body);
-        $line .= " {$meta}" if length $meta;
-        $line .= " [$r->{path}]";
-
-        print STDERR wrap($line, 0) . "\n";
         $i++;
     }
 
@@ -1607,13 +1593,7 @@ sub cmd_glance {
     my @selected = map { $matches[$_ - 1] } @nums;
 
     print "\n";
-    print "$query\n\n";
-    print scalar(@selected) . " selected result(s)\n\n";
-
-    for my $i (0 .. $#selected) {
-        show($selected[$i]);
-        print "\n" if $i < $#selected;
-    }
+    print_query_results($query, \@selected, "selected result");
 }
 
 # ============================================================
@@ -1625,8 +1605,12 @@ sub show_numbered {
 
     my $i = 1;
     for my $r (@items) {
-        print "\n[$i]";
-        show($r);
+        show_numbered_line($i, $r, *STDOUT);
+
+        print "\n"
+            if $OUTPUT_MODE eq "basic"
+            && $i < @items;
+
         $i++;
     }
 }
@@ -1687,7 +1671,6 @@ sub cmd_edit_batch {
     my @matches = query_records($query);
     print_query_warnings();
 
-    print scalar(@matches) . " match(es)\n";
     show_numbered(@matches);
 
     return unless @matches;
@@ -1708,7 +1691,6 @@ sub cmd_edit_mode {
         my @matches = query_records($query);
         print_query_warnings();
 
-        print "\n" . scalar(@matches) . " match(es)\n";
         show_numbered(@matches);
 
         if (!@matches) {
@@ -1760,7 +1742,7 @@ sub cmd_edit_mode {
 # OUTPUT
 # ============================================================
 
-sub show {
+sub record_line {
     my ($r) = @_;
 
     my $meta = display_meta($r);
@@ -1776,10 +1758,80 @@ sub show {
     $line .= " {$meta}" if length $meta;
     $line .= " [$r->{path}]";
 
-    if (-t STDOUT) {
+    $line =~ s/[\r\n]+/ /g;
+    return trim($line);
+}
+
+sub print_line {
+    my ($line) = @_;
+
+    if ($OUTPUT_WRAP) {
         print wrap($line, 0) . "\n";
-    } else {
+        return;
+    }
+
+    if ($OUTPUT_NO_AUTOWRAP && -t STDOUT) {
+        print "\e[?7l";
+        print "$line";
+        print "\e[?7h";
+        print "\n";
+        return;
+    }
+
+    print "$line\n";
+}
+
+sub show_numbered_line {
+    my ($i, $r, $fh) = @_;
+    $fh ||= *STDOUT;
+
+    my $line = "[$i] " . record_line($r);
+
+    if ($OUTPUT_WRAP) {
+        print $fh wrap($line, 0) . "\n";
+    }
+    elsif ($OUTPUT_NO_AUTOWRAP && -t $fh) {
+        print $fh "\e[?7l";
+        print $fh "$line";
+        print $fh "\e[?7h";
+        print $fh "\n";
+    }
+    else {
+        print $fh "$line\n";
+    }
+}
+
+sub show {
+    my ($r) = @_;
+
+    my $line = record_line($r);
+
+    if ($OUTPUT_WRAP) {
+        print wrap($line, 0) . "\n";
+    }
+    elsif ($OUTPUT_NO_AUTOWRAP && -t STDOUT) {
+        print "\e[?7l";
+        print "$line";
+        print "\e[?7h";
+        print "\n";
+    }
+    else {
         print "$line\n";
+    }
+}
+
+sub print_query_header {
+    return;
+}
+
+sub print_query_results {
+    my ($query, $records_ref, $label) = @_;
+
+    my @out = @$records_ref;
+
+    for my $i (0 .. $#out) {
+        show($out[$i]);
+        print "\n" if $OUTPUT_MODE eq "basic" && $i < $#out;
     }
 }
 
@@ -1925,7 +1977,7 @@ sub dispatch_command {
 
     return 0 unless defined $cmd && length $cmd;
 
-    my %builtins = map { $_ => 1 } qw(help init edit glance);
+    my %builtins = map { $_ => 1 } qw(help init edit glance basic compact pipe pretty wrap);
     return 0 if $builtins{$cmd};
 
     my $script_dir = ark_script_dir();
@@ -1955,6 +2007,28 @@ sub dispatch_command {
 # ============================================================
 
 my $cmd = $ARGV[0] // "";
+
+while (1) {
+    if ($cmd eq "--basic" || $cmd eq "basic" || $cmd eq "pretty") {
+        $OUTPUT_MODE = "basic";
+    }
+    elsif ($cmd eq "--compact" || $cmd eq "compact") {
+        $OUTPUT_MODE = "compact";
+        $OUTPUT_NO_AUTOWRAP = 1;
+    }
+    elsif ($cmd eq "--pipe" || $cmd eq "pipe") {
+        $OUTPUT_MODE = "pipe";
+    }
+    elsif ($cmd eq "--wrap" || $cmd eq "wrap") {
+        $OUTPUT_WRAP = 1;
+    }
+    else {
+        last;
+    }
+
+    shift @ARGV;
+    $cmd = $ARGV[0] // "";
+}
 
 if ($cmd eq "help" || $cmd eq "--help") {
     usage();
