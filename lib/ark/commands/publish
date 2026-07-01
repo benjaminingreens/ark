@@ -170,7 +170,7 @@ sub default_template {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{title}}</title>
-<link rel="stylesheet" href="{{asset_prefix}}assets/publish.css">
+<link rel="stylesheet" href="{{asset_prefix}}assets/publish.css?v={{css_version}}">
 </head>
 <body>
 <main class="content">
@@ -438,11 +438,13 @@ sub render_page {
     $breadcrumb //= breadcrumb_html(["index.html", repo_name()]);
 
     my $html = $template;
+    my $css_version = time();
 
     $html =~ s/\{\{title\}\}/html($title)/ge;
     $html =~ s/\{\{content\}\}/$content/g;
     $html =~ s/\{\{asset_prefix\}\}/$asset_prefix/g;
     $html =~ s/\{\{breadcrumb\}\}/$breadcrumb/g;
+    $html =~ s/\{\{css_version\}\}/$css_version/g;
 
     return $html;
 }
@@ -626,6 +628,33 @@ li {
   text-decoration: none;
 }
 
+/* Tables */
+
+.table-wrap {
+  overflow-x: auto;
+  margin: 26px 0;
+}
+
+table {
+  border-collapse: collapse;
+  width: max-content;
+  min-width: 100%;
+}
+
+th,
+td {
+  border: 1px solid #666;
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+th {
+  font-weight: bold;
+  background: #111;
+}
+
 /* Desktop */
 
 @media (min-width: 768px) {
@@ -674,6 +703,18 @@ sub breadcrumb_html {
          . '</span>';
 }
 
+sub inline_markdown {
+    my ($text) = @_;
+
+    $text = html($text);
+
+    $text =~ s/\*\*(.+?)\*\*/<strong>$1<\/strong>/g;
+    $text =~ s/\*(.+?)\*/<em>$1<\/em>/g;
+    $text =~ s/\[(.+?)\]\((.+?)\)/<a href="$2">$1<\/a>/g;
+
+    return $text;
+}
+
 sub markdown_to_html {
     my ($md) = @_;
 
@@ -704,8 +745,73 @@ sub markdown_to_html {
         }
     };
 
-    for my $line (@lines) {
+    for (my $i = 0; $i <= $#lines; $i++) {
+        my $line = $lines[$i];
         $line =~ s/\r$//;
+
+        if ($line =~ /^\s*---csv\s*$/) {
+
+            $close_p->();
+            $close_ul->();
+            $close_ol->();
+
+            my @rows;
+
+            $i++;
+
+            while ($i <= $#lines) {
+
+                my $csvline = $lines[$i];
+                $csvline =~ s/\r$//;
+
+                last if $csvline =~ /^\s*$/;
+
+                my @fields = map {
+                    s/^\s+//;
+                    s/\s+$//;
+                    $_;
+                } split /,/, $csvline, -1;
+
+                push @rows, \@fields;
+
+                $i++;
+            }
+
+            if (@rows) {
+
+                $out .= "<div class=\"table-wrap\">\n";
+                $out .= "<table>\n";
+
+                $out .= "<thead><tr>";
+                for my $cell (@{$rows[0]}) {
+                    $out .= "<th>" . html($cell) . "</th>";
+                }
+                $out .= "</tr></thead>\n";
+
+                if (@rows > 1) {
+
+                    $out .= "<tbody>\n";
+
+                    for my $row (@rows[1 .. $#rows]) {
+
+                        $out .= "<tr>";
+
+                        for my $cell (@$row) {
+                            $out .= "<td>" . inline_markdown($cell) . "</td>";
+                        }
+
+                        $out .= "</tr>\n";
+                    }
+
+                    $out .= "</tbody>\n";
+                }
+
+                $out .= "</table>\n";
+                $out .= "</div>\n";
+            }
+
+            next;
+        }
 
         if ($line =~ /^\s*$/) {
             $close_p->();
