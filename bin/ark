@@ -603,12 +603,28 @@ sub replace_meta_raw {
 sub remove_meta_token {
     my ($meta_ref, $token) = @_;
 
-    if ($token =~ /^(.+)\*$/) {
-        my $prefix = $1;
-        return [grep { index($_->{raw}, $prefix) != 0 } @$meta_ref];
+    # Remove by metadata prefix
+    if ($token =~ /^[!%><=\$@~&]$/) {
+        return [
+            grep { index($_->{raw}, $token) != 0 }
+            @$meta_ref
+        ];
     }
 
-    return [grep { $_->{raw} ne $token } @$meta_ref];
+    # Existing wildcard support
+    if ($token =~ /^(.+)\*$/) {
+        my $prefix = $1;
+        return [
+            grep { index($_->{raw}, $prefix) != 0 }
+            @$meta_ref
+        ];
+    }
+
+    # Exact match
+    return [
+        grep { $_->{raw} ne $token }
+        @$meta_ref
+    ];
 }
 
 sub add_meta_token {
@@ -1438,34 +1454,38 @@ sub update_block_meta {
 }
 
 sub edited_block {
-    my ($r, $op, @args) = @_;
-
-    @args = map { expand_dynamic_edit_token($_) } @args;
+    my ($r, $operations_ref) = @_;
 
     my @meta = map { { %$_ } } @{$r->{meta}};
     my $meta_ref = \@meta;
 
-    if ($op eq "add" || $op eq "a") {
-        for my $tok (@args) {
-            $meta_ref = add_meta_token($meta_ref, $tok);
+    for my $edit (@$operations_ref) {
+
+        my ($op, @args) = @$edit;
+        @args = map { expand_dynamic_edit_token($_) } @args;
+
+        if ($op eq "add" || $op eq "a") {
+            for my $tok (@args) {
+                $meta_ref = add_meta_token($meta_ref, $tok);
+            }
         }
-    }
-    elsif ($op eq "remove" || $op eq "r") {
-        for my $tok (@args) {
-            $meta_ref = remove_meta_token($meta_ref, $tok);
+        elsif ($op eq "remove" || $op eq "r") {
+            for my $tok (@args) {
+                $meta_ref = remove_meta_token($meta_ref, $tok);
+            }
         }
-    }
-    elsif ($op eq "set" || $op eq "s") {
-        for my $tok (@args) {
-            $meta_ref = set_meta_token($meta_ref, $tok);
+        elsif ($op eq "set" || $op eq "s") {
+            for my $tok (@args) {
+                $meta_ref = set_meta_token($meta_ref, $tok);
+            }
         }
-    }
-    elsif ($op eq "replace" || $op eq "p") {
-        die "replace needs OLD NEW\n" unless @args == 2;
-        $meta_ref = replace_meta_token($meta_ref, $args[0], $args[1]);
-    }
-    else {
-        die "Unknown edit operation: $op\n";
+        elsif ($op eq "replace" || $op eq "p") {
+            die "replace needs OLD NEW\n" unless @args == 2;
+            $meta_ref = replace_meta_token($meta_ref, $args[0], $args[1]);
+        }
+        else {
+            die "Unknown edit operation: $op\n";
+        }
     }
 
     return update_block_meta($r->{raw_block}, $meta_ref);
@@ -1482,6 +1502,67 @@ sub replace_first {
 }
 
 sub apply_edit_to_records {
+    my ($records_ref, $operations_ref) = @_;
+    my @selected   = @$records_ref;
+    my @operations = @$operations_ref;
+
+    return unless @selected;
+
+    my %by_path;
+    push @{$by_path{$_->{path}}}, $_ for @selected;
+
+    my $files_changed   = 0;
+    my $records_changed = 0;
+
+    for my $path (sort keys %by_path) {
+
+        open my $fh, "<:encoding(UTF-8)", $path or do {
+            warn "Cannot read $path: $!\n";
+            next;
+        };
+        local $/;
+        my $text = <$fh>;
+        close $fh;
+
+        my $new_text     = $text;
+        my $file_changed = 0;
+
+        for my $r (@{$by_path{$path}}) {
+
+            my $block = edited_block($r, \@operations);
+
+            my ($tmp, $ok) = replace_first(
+                $new_text,
+                $r->{raw_block},
+                $block
+            );
+
+            if ($ok) {
+                $new_text = $tmp;
+                $file_changed = 1;
+                $records_changed++;
+            }
+            else {
+                warn "Could not replace block in $path\n";
+            }
+        }
+
+        if ($file_changed && $new_text ne $text) {
+            open my $out, ">:encoding(UTF-8)", $path
+                or die "Cannot write $path: $!";
+            print $out $new_text;
+            close $out;
+
+            print "updated $path\n";
+            $files_changed++;
+        }
+    }
+
+    print "done: $records_changed record(s), $files_changed file(s) changed\n";
+    print "review with: git diff\n";
+}
+
+sub apply_single_edit_to_records {
     my ($records_ref, $op, @args) = @_;
     my @selected = @$records_ref;
 
@@ -1506,7 +1587,12 @@ sub apply_edit_to_records {
         my $file_changed = 0;
 
         for my $r (@{$by_path{$path}}) {
-            my $new_block = edited_block($r, $op, @args);
+            my $new_block = edited_block(
+                $r,
+                [
+                    [$op, @args]
+                ]
+            );
             my ($tmp, $ok) = replace_first($new_text, $r->{raw_block}, $new_block);
 
             if ($ok) {
@@ -1690,7 +1776,12 @@ sub cmd_edit_batch {
     my $desc = join " ", ($op, @args);
     return unless confirm("Apply edit '$desc' to all " . scalar(@matches) . " record(s)?");
 
-    apply_edit_to_records(\@matches, $op, @args);
+    apply_edit_to_records(
+        \@matches,
+        [
+            [$op, @args]
+        ]
+    );
 }
 
 sub cmd_edit_mode {
@@ -1734,17 +1825,36 @@ sub cmd_edit_mode {
 
         last if $line =~ /^q(uit)?$/i;
 
-        my ($op, @args) = parse_operation_line($line);
-        if (!$op || !@args) {
-            print "No operation given.\n";
+        my @operations;
+
+        for my $chunk (split /\s*;;\s*/, $line) {
+            my ($op, @args) = parse_operation_line($chunk);
+
+            if (!$op || !@args) {
+                print "Invalid operation: $chunk\n";
+                next;
+            }
+
+            push @operations, [$op, @args];
+        }
+        if (!@operations) {
+            print "No valid operations given.\n";
             next;
         }
 
-        my $desc = join " ", ($op, @args);
-        next unless confirm("Apply edit '$desc' to " . scalar(@selected) . " selected record(s)?");
+        my $desc = join(
+            " ;; ",
+            map { join(" ", @$_) } @operations
+        );
 
-        apply_edit_to_records(\@selected, $op, @args);
+        next unless confirm(
+            "Apply edits '$desc' to "
+            . scalar(@selected)
+            . " selected record(s)?"
+        );
 
+        apply_edit_to_records(\@selected, \@operations);
+        
         print "\nReloading records...\n";
         load_records();
     }
