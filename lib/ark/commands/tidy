@@ -424,7 +424,7 @@ sub process_file {
     my $new_txt = "";
     my $pos     = 0;
 
-    while ($txt =~ /((?:^|\n)\s*(note|todo|evnt)\s*:\s*(.*?)\s*;;)/sg) {
+    while ($txt =~ /(^[ \t]*(note|todo|evnt)\s*:\s*(.*?);;)/msg) {
         my ($whole, $type, $raw) = ($1, $2, $3);
         my $start = $-[1];
         my $end   = $+[1];
@@ -451,17 +451,17 @@ sub process_file {
             }
         } else {
             $new_txt .= $record;
-            $new_txt .= "\n" unless $record =~ /\n\z/;
         }
 
         $pos = $end;
-        $pos += length($1) if substr($txt, $pos) =~ /^(\s+)/;
-
     }
 
     return unless $found;
 
     $new_txt .= substr($txt, $pos);
+
+    # collapse trailing blank lines to one final newline
+    $new_txt =~ s/\n+\z/\n/;
 
     if ($move_out) {
         my $left = trim($new_txt);

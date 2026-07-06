@@ -663,11 +663,19 @@ sub query_time_range {
     my @tokens = split_query_tokens($query);
 
     for my $tok (@tokens) {
+
         return (today_start_epoch(), add_interval(today_start_epoch(), 1, "d"))
             if $tok eq "today";
 
         return (today_start_epoch(), add_interval(today_start_epoch(), 7, "d"))
             if $tok eq "week";
+
+        if ($tok =~ /^(\d+)([dwmy])$/) {
+            return (
+                today_start_epoch(),
+                add_interval(today_start_epoch(), $1, $2)
+            );
+        }
     }
 
     return (today_start_epoch(), add_interval(today_start_epoch(), 1, "d"));
@@ -1161,27 +1169,31 @@ sub matches_one {
 
     return 1 if $q =~ /^[<>]/;
 
-    if ($q eq "today") {
+    if (
+        $q eq "today"
+        || $q eq "week"
+        || $q =~ /^(\d+)([dwmy])$/
+    ) {
         return 0 unless $r->{type} eq "evnt";
 
         my $start_raw = meta_value($r, ">");
         my $start = parse_datetime($start_raw);
         return 0 unless $start;
 
+        my ($n, $u);
+
+        if ($q eq "today") {
+            ($n, $u) = (1, "d");
+        }
+        elsif ($q eq "week") {
+            ($n, $u) = (7, "d");
+        }
+        else {
+            ($n, $u) = ($1, $2);
+        }
+
         my $from = today_start_epoch();
-        my $to   = add_interval($from, 1, "d");
-
-        return $start->{epoch} >= $from && $start->{epoch} < $to;
-    }
-    elsif ($q eq "week") {
-        return 0 unless $r->{type} eq "evnt";
-
-        my $start_raw = meta_value($r, ">");
-        my $start = parse_datetime($start_raw);
-        return 0 unless $start;
-
-        my $from = today_start_epoch();
-        my $to   = add_interval($from, 7, "d");
+        my $to   = add_interval($from, $n, $u);
 
         return $start->{epoch} >= $from && $start->{epoch} < $to;
     }
