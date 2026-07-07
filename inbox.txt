@@ -20,6 +20,7 @@ todo: somehow automatically run edit and normalise views before report?
 todo: fix numbered lists and scroll right on topbar in publish script
 todo: different output types for queries - default should be ugly and pipeable, then allow for 'prettier' outputs
 todo: the tidy script doesnt seem to be organising by creation for every note
+todo: should ark not be able to edit other repos (that are downstream, not upstream) - so like benjamin/rebecca can edit hammond, but not vice versa?
 note: 
 
 incorporate following where relevant
