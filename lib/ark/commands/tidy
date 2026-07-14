@@ -86,7 +86,15 @@ $REPO ||= "ark";
 my %grouped;
 my @delete_files;
 my %rewrite_files;
-my $note_counter = 0;
+
+# Tracks content signatures seen during this run, to warn (never to
+# silently drop -- see normalise_record) about likely accidental
+# duplicates, e.g. the same line pasted into inbox.txt twice before ever
+# being tidied. Cross-run duplicate detection isn't attempted: adding
+# the same content again next week is a legitimate new record, not a
+# duplicate, for a todo/note app.
+my %seen_signatures;
+my @duplicate_warnings;
 
 my $SHOW_PROGRESS = -t STDERR && !$ENV{ARK_NO_PROGRESS};
 my $last_progress_pct = -1;
@@ -381,6 +389,8 @@ sub normalise_record {
 
     @tokens = order_meta(@tokens);
 
+    check_duplicate_signature($type, $content, @tokens);
+
     my $meta_txt = join "; ", @tokens;
 
     if ($type eq "note" && ($force_multiline_note || is_multiline_content($content))) {
@@ -388,6 +398,22 @@ sub normalise_record {
     }
 
     return "$type: $content {$meta_txt};;";
+}
+
+sub check_duplicate_signature {
+    my ($type, $content, @tokens) = @_;
+
+    my @meaningful = sort grep {
+        my $kind = token_kind($_);
+        $kind ne "created" && $kind ne "id";
+    } @tokens;
+
+    my $sig = join("\x1e", $type, lc(trim($content)), @meaningful);
+
+    if ($seen_signatures{$sig}++) {
+        my $shown = length($content) > 60 ? substr($content, 0, 60) . "..." : $content;
+        push @duplicate_warnings, "$type: $shown";
+    }
 }
 
 sub extract_title {
@@ -765,4 +791,10 @@ if ($APPLY) {
     print "operation: $operation\n";
     print "level: $LEVEL\n";
     print "compact: " . ($COMPACT ? "yes" : "no") . "\n";
+}
+
+if (@duplicate_warnings) {
+    print "\nwarning: possible duplicate record(s) in this run (same type/content/tags),\n";
+    print "filed anyway -- review and remove by hand if unintended:\n";
+    print "  - $_\n" for @duplicate_warnings;
 }

@@ -31,12 +31,14 @@ everything is greppable, diffable, and versionable with git.
 - [Output modes](#output-modes)
 - [Editing records](#editing-records)
 - [Glance](#glance)
+- [Archive](#archive)
 - [Recurring events](#recurring-events)
 - [Tidy](#tidy)
 - [Publish](#publish)
 - [Configuration (`.arkrc`)](#configuration-arkrc)
 - [Environment variables](#environment-variables)
 - [Command reference](#command-reference)
+- [Development](#development)
 - [Status](#status)
 
 ---
@@ -259,7 +261,19 @@ An alias's value can itself be one or more `;;`-separated **steps**,
 each of which is either a plain query, or an `edit`/`glance` invocation
 — letting an alias chain interactive or batch-editing steps. This is
 exactly what the default `.arkrc` created by `ark init` sets up (see
-[Configuration](#configuration-arkrc)).
+[Configuration](#configuration-arkrc)). This `glance`/`edit` routing
+only ever applies to steps that came from an alias substitution — a
+literal query you type directly, even one that happens to start with
+the word `glance` or `edit`, is always treated as a plain query and
+never misrouted to that command.
+
+An alias name that collides with a word that already means something on
+its own (a record type, `today`/`week`, a command, an output mode) would
+silently shadow it, so ark prints a warning at startup if you define
+one:
+```text
+warning: query alias 'today' shadows a built-in word/command of the same name
+```
 
 ---
 
@@ -269,16 +283,55 @@ Put one of these before the query (or as a query word):
 
 | Mode | Effect |
 |---|---|
-| `pipe` (default) | plain, one result per line |
-| `basic` | blank line between results |
-| `compact` | one result per line, autowrap disabled (long lines scroll instead of wrapping — handy in a real terminal) |
-| `wrap` | wrap long lines at terminal width (`$COLUMNS`, or the terminal's actual width) |
+| `pipe` (default) | plain, **never colored**, one result per line — the guaranteed-stable format for scripting |
+| `basic` | blank line between results; colored when the terminal allows |
+| `compact` | one result per line, autowrap disabled (long lines scroll instead of wrapping — handy in a real terminal); colored when allowed |
+| `pretty` | multi-line colored "cards" (see below); colored when allowed |
+| `wrap` | modifier, combinable with any mode: wrap long lines at terminal width (`$COLUMNS`, or the terminal's actual width) |
 
 ```bash
 ark basic 'todo'
 ark compact 'todo'
+ark pretty 'todo'
 ark wrap 'todo'
 ```
+
+`pretty` mode renders each record as a short card instead of one dense
+line — a content line, then an indented line of the fields that matter
+for reading at a glance (tag, priority, status, deadline, evnt time),
+with the noisier `~created`/`&id` left out:
+
+```text
+[ ] Buy milk
+  #home  priority 1  todo  due 2026-08-11  ./todo/2026/07/todo_202607_002.txt
+
+[x] Completed task
+  #work  priority 3  done  ./todo/2026/07/todo_202607_002.txt
+```
+
+### Color
+
+Color is opt-out, not opt-in: it's on automatically in `basic`/
+`compact`/`pretty` whenever stdout is a real terminal, and off
+otherwise (piped, redirected, or a non-interactive shell) — no flags
+needed either way. Overdue deadlines and top priority show in red, due-
+today in yellow, done items dim and struck through, tags cyan, evnt
+times blue, and so on.
+
+- `NO_COLOR=1` (see [no-color.org](https://no-color.org)) or
+  `ARK_COLOR=never` disable it.
+- `ARK_COLOR=always` forces it on (e.g. for `less -R`), taking
+  precedence over `NO_COLOR`.
+- `pipe` mode **never** colors, regardless of any of the above — that's
+  what makes it the safe default for scripts and pipelines.
+- Combining `wrap` with a colored mode suppresses color for that call,
+  since ANSI codes would otherwise throw off the wrap-width
+  calculation.
+
+Pin your own preferred default (so you don't have to type `pretty`/
+`compact` every time) with `.arkrc`'s `[defaults] output=`; see
+[Configuration](#configuration-arkrc). An explicit mode word on the
+command line always overrides it.
 
 ---
 
@@ -346,6 +399,38 @@ query alias (see [Query aliases](#query-aliases)).
 
 ---
 
+## Archive
+
+```bash
+ark archive 'QUERY'
+```
+
+Ark has no delete command, by design — instead, `archive` shows a
+numbered list of matches and asks which to move
+(`all` / `none` / `1,3,5-8` / `q`), the same selection UI as glance:
+
+```text
+[1] todo: Buy milk {!2; #home} [...]
+[2] todo: Call Mum {!1; #family} [...]
+
+Select records to archive [all/none/1,3,5-8/q]:
+```
+
+Selected records are moved, verbatim, out of whatever file they're
+currently in and appended into `archive/TYPE/yyyy/mm/` (grouped by the
+record's own `~created` date, falling back to today if a record
+predates that metadata). Nothing is deleted — archived records simply
+stop appearing in ordinary queries, since `archive/` isn't one of the
+`note`/`todo`/`evnt` roots ark scans. If a source file ends up empty
+once its archived record(s) are removed, that empty file is deleted;
+files with other records left in them are just rewritten without the
+archived ones.
+
+Bring something back by hand — it's still a plain `.txt` record, just
+under `archive/` instead of `note/`/`todo/`/`evnt/`.
+
+---
+
 ## Recurring events
 
 An evnt's `^` metadata is a recurrence pattern applied to its `>` start
@@ -373,6 +458,14 @@ only show a recurring #work event if it happens to recur today — add
 unaffected by this default window and match regardless of date unless
 you add a time condition yourself.
 
+A comparison against evnt start/end (`>`/`<`) with a date also widens
+this window to cover it, so you don't need `week`/`Nd` just to reach
+further out:
+```bash
+ark 'evnt, ><=+30d'        # recurring events widen to cover the next 30 days
+ark 'evnt, >>=20260901'    # widens to include (at least) that date
+```
+
 ---
 
 ## Tidy
@@ -386,7 +479,7 @@ it would do).
 | Flag | Effect |
 |---|---|
 | `--clean` | reformat records in place: fill in missing `~created`/`&id`/`$authour`/`#tag` (todo also gets `=status`/`!priority`/`@assignee`), and order metadata tokens consistently. Never moves a record to a different file. |
-| `--tidy` | clean, **and** group loose single-line records out of whatever file they were found in into `TYPE/yyyy/mm/` batch files; multiline notes get their own file (named from `/title`, or a timestamp if untitled). Files named with a leading `_` are reformatted in place but never emptied out. |
+| `--tidy` | clean, **and** group loose single-line records out of whatever file they were found in into `TYPE/yyyy/mm/` batch files; multiline notes get their own file (named from `/title`, or a timestamp if untitled). Files named with a leading `_` are reformatted in place but never emptied out. Warns (without dropping anything) if the same content shows up more than once in a single run — most likely an accidental double-paste, e.g. running `ark add` twice by habit. |
 | `--compact` | within each `TYPE/yyyy/mm/` directory, merge all files back into as few files as possible (max 1000 records each), dropping duplicates (matched by `&id`, else by exact text). Skips any month containing a multiline note. |
 | *(none)* | same as `--tidy --1` |
 
@@ -405,6 +498,12 @@ ark tidy --apply               # actually file inbox.txt away
 ark tidy --clean --2 --apply   # reformat all loose files in place
 ark tidy --compact --apply     # merge/dedupe files under TYPE/yyyy/mm/
 ```
+
+The duplicate-content warning only looks within a single `tidy` run,
+deliberately — cross-run detection isn't attempted, because adding the
+same content again next week (or next year) is a legitimate new record
+for a todo/note app, not a duplicate. It's really only catching "you
+pasted this twice a second ago," which is the case worth flagging.
 
 ---
 
@@ -454,8 +553,23 @@ Created by `ark init` with these defaults:
 authour=
 assignee=
 tag=general
+# output=compact   # uncomment to make compact/basic/pretty the default view instead of pipe
 
 [queries]
+# Everyday shortcuts -- e.g. `ark overdue`, `ark high`. None of these
+# names collide with a built-in word/command; ark warns you at startup
+# if you ever add one that does.
+overdue = todo, --=done, %<today
+duesoon = todo, --=done, %<=+3d, %>=today
+undated = todo, --=done, --%
+high = todo, --=done, !<=1
+done = todo, -=done
+backlog = todo, --=done, >!
+upcoming = evnt, week, >>
+
+# Priority/deadline decay: nudges stale todos' priority and deadline
+# metadata forward as they age. Run it yourself, e.g. `ark normalise` --
+# nothing here runs automatically.
 normalise =
   edit 'todo, -=todo, !=1, --%' set '%+2w'
   ;; edit 'todo, -=todo, !=2, --%' set '%+4w'
@@ -464,6 +578,8 @@ normalise =
   ;; edit 'todo, -=todo, !<2, %>=-4w, %<=-2w' set '!2'
   ;; edit 'todo, -=todo, !<3, %<-4w' set '!3'
 
+# A multi-step daily/weekly review: this week's events, today's events,
+# then three interactive glance picks over the open todo backlog.
 report =
   evnt, week, --^, >>
   ;; evnt, today, -^, >>
@@ -473,21 +589,24 @@ report =
   ;; glance 'random(todo, -=todo, -!3; 2)'
 ```
 
-`normalise` and `report` are ordinary aliases (see
-[Query aliases](#query-aliases)) — nothing runs automatically; you
-invoke them with `ark normalise` / `ark report` like any other query.
-Note that each line after the first in a `[queries]` entry is a
-**continuation**, joined onto the same alias and split into
-`;;`-separated steps — the leading `;;` on each line above is exactly
-that separator, not a comment.
+The one-line aliases (`overdue`, `duesoon`, `undated`, `high`, `done`,
+`backlog`, `upcoming`) are ordinary single-step queries — see
+[Querying](#querying) for what each condition means. `normalise` and
+`report` are multi-step aliases (see [Query aliases](#query-aliases))
+— nothing runs automatically; you invoke them with `ark normalise` /
+`ark report` like any other query. Note that each line after the first
+in a `[queries]` entry is a **continuation**, joined onto the same
+alias and split into `;;`-separated steps — the leading `;;` on each
+continuation line above is exactly that separator, not a comment
+(lines starting with `#` *are* comments, and are skipped).
 
 ### Sections
 
 | Section | Contents |
 |---|---|
 | `[bases]` | one extra directory per line to also scan for `note/`, `todo/`, `evnt/` (in addition to the repository root); `~` expands to your home directory |
-| `[defaults]` | `authour=`, `assignee=`, `tag=` (used by `ark tidy`), `no_publish=` (used by `ark publish`) |
-| `[queries]` | `name = query`, a reusable alias usable as a query word; indented continuation lines extend the same alias |
+| `[defaults]` | `authour=`, `assignee=`, `tag=` (used by `ark tidy`), `no_publish=` (used by `ark publish`), `output=` (used by the query engine — see [Output modes](#output-modes)) |
+| `[queries]` | `name = query`, a reusable alias usable as a query word; indented continuation lines extend the same alias. A name that collides with a built-in word prints a warning (see [Query aliases](#query-aliases)) |
 | `[functions]` | `name = path/to/file.pl` — a Perl file `require`'d at startup, which must define a sub `arkfunc_name(query, arg, \@records, $run_query)` |
 | `[function name]` | an inline Perl body for `arkfunc_name`, read verbatim until the next `[section]` — an alternative to `[functions]` for small one-off functions |
 | `[publish]` | tag names to publish, one per line (see [Publish](#publish)) |
@@ -498,9 +617,11 @@ that separator, not a comment.
 
 | Variable | Effect |
 |---|---|
-| `ARK_YES` | skip all confirmation prompts (batch edit, tidy would still require `--apply` to write) |
+| `ARK_YES` | skip all confirmation prompts (batch edit, archive, tidy would still require `--apply` to write) |
 | `ARK_NO_PROGRESS` | disable the scanning progress bar |
 | `COLUMNS` | terminal width used by `wrap` output mode (falls back to actual terminal width, then 80) |
+| `NO_COLOR` | disable color in `basic`/`compact`/`pretty` (see [Color](#color)); any value counts |
+| `ARK_COLOR` | `never` disables color, `always` forces it on (overriding `NO_COLOR` and the terminal check) |
 | `ARK_COMMAND_DIR` | extra directory to search first for command scripts (like `tidy`, `publish`, `add`) |
 | `ARK_PUBLISH_TEMPLATE` | path to a custom HTML template for `ark publish`, overriding `.ark/publish.html` |
 
@@ -517,6 +638,7 @@ ark add TYPE 'CONTENT'       append a record to inbox.txt
 ark edit 'QUERY'             interactive edit mode over the matches
 ark edit 'QUERY' OP ARGS     batch edit all matches, no prompts
 ark glance 'QUERY' [...]     numbered list; choose which matches to print
+ark archive 'QUERY'          numbered list; move chosen matches to archive/
 ark tidy [OPTS]              reformat / organise / compact record files
 ark publish                  build a static site from tagged notes
 ark help                     show a summary of all of the above
@@ -524,6 +646,21 @@ ark help                     show a summary of all of the above
 
 Run `ark help` at any time for a terminal-friendly version of this
 reference.
+
+---
+
+## Development
+
+```bash
+t/run.sh
+```
+
+Runs the project's regression suite: builds a scratch repo, drives
+`ark` through the query engine, edit/glance/archive, tidy (all three
+operations), output modes/color, and publish, and asserts on specific
+behaviors rather than diffing golden output (dates and ids are dynamic
+by design). Exits non-zero if anything fails. Run it before and after
+any change to `bin/ark` or `lib/ark/`.
 
 ---
 

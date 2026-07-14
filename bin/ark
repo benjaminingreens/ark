@@ -28,6 +28,16 @@ binmode(STDERR, ":encoding(UTF-8)");
 # sorted on.
 # ============================================================
 
+# Words that mean something as a whole top-level query argument on their
+# own (record types, time windows, commands, output modes). A [queries]
+# alias sharing one of these names would silently shadow it -- see
+# warn_on_alias_collisions().
+my @RESERVED_WORDS = qw(
+    todo note evnt today week
+    help init add edit glance archive tidy publish
+    pipe basic compact wrap pretty
+);
+
 my @TYPES = qw(note todo evnt);
 my %CONFIG = load_arkrc();
 my @BASES = @{$CONFIG{bases}};
@@ -38,9 +48,10 @@ my $SHOW_PROGRESS = -t STDERR
     && !$ENV{ARK_NO_PROGRESS}
     && (($ENV{TERM} // "") ne "dumb");
 my $last_progress_pct = -1;
-my $OUTPUT_MODE = "pipe"; # pipe | basic | compact
+my $OUTPUT_MODE = "pipe"; # pipe | basic | compact | pretty
 my $OUTPUT_WRAP = 0;
 my $OUTPUT_NO_AUTOWRAP = 0;
+my $OUTPUT_MODE_EXPLICIT = 0; # true once a mode word is seen on the CLI
 
 # ============================================================
 # BASIC HELPERS
@@ -65,31 +76,49 @@ sub cmd_init {
     if (!-f ".arkrc") {
         open my $fh, ">:encoding(UTF-8)", ".arkrc" or die "Cannot write .arkrc: $!\n";
 
-        print $fh "[bases]\n";
-        print $fh ".\n\n";
+        print $fh <<'ARKRC';
+[bases]
+.
 
-        print $fh "[defaults]\n";
-        print $fh "authour=\n";
-        print $fh "assignee=\n";
-        print $fh "tag=general\n\n";
+[defaults]
+authour=
+assignee=
+tag=general
+# output=compact   # uncomment to make compact/basic/pretty the default view instead of pipe
 
-        print $fh "[queries]\n";
+[queries]
+# Everyday shortcuts -- e.g. `ark overdue`, `ark high`. None of these
+# names collide with a built-in word/command; ark warns you at startup
+# if you ever add one that does.
+overdue = todo, --=done, %<today
+duesoon = todo, --=done, %<=+3d, %>=today
+undated = todo, --=done, --%
+high = todo, --=done, !<=1
+done = todo, -=done
+backlog = todo, --=done, >!
+upcoming = evnt, week, >>
 
-        print $fh "normalise =\n";
-        print $fh "  edit 'todo, -=todo, !=1, --%' set '%+2w'\n";
-        print $fh "  ;; edit 'todo, -=todo, !=2, --%' set '%+4w'\n";
-        print $fh "  ;; edit 'todo, -=todo, !>1, %>=today, %<+2w' set '!1'\n";
-        print $fh "  ;; edit 'todo, -=todo, !>2, %>=+2w, %<=+4w' set '!2'\n";
-        print $fh "  ;; edit 'todo, -=todo, !<2, %>=-4w, %<=-2w' set '!2'\n";
-        print $fh "  ;; edit 'todo, -=todo, !<3, %<-4w' set '!3'\n\n";
+# Priority/deadline decay: nudges stale todos' priority and deadline
+# metadata forward as they age. Run it yourself, e.g. `ark normalise` --
+# nothing here runs automatically.
+normalise =
+  edit 'todo, -=todo, !=1, --%' set '%+2w'
+  ;; edit 'todo, -=todo, !=2, --%' set '%+4w'
+  ;; edit 'todo, -=todo, !>1, %>=today, %<+2w' set '!1'
+  ;; edit 'todo, -=todo, !>2, %>=+2w, %<=+4w' set '!2'
+  ;; edit 'todo, -=todo, !<2, %>=-4w, %<=-2w' set '!2'
+  ;; edit 'todo, -=todo, !<3, %<-4w' set '!3'
 
-        print $fh "report =\n";
-        print $fh "  evnt, week, --^, >>\n";
-        print $fh "  ;; evnt, today, -^, >>\n";
-        print $fh "  ;; glance 'todo, -=todo, (-!1|-!2), >!'\n";
-        print $fh "  ;; glance 'newest(todo, -=todo, -!3; 2)'\n";
-        print $fh "  ;; glance 'oldest(todo, -=todo, -!3; 2)'\n";
-        print $fh "  ;; glance 'random(todo, -=todo, -!3; 2)'\n";
+# A multi-step daily/weekly review: this week's events, today's events,
+# then three interactive glance picks over the open todo backlog.
+report =
+  evnt, week, --^, >>
+  ;; evnt, today, -^, >>
+  ;; glance 'todo, -=todo, (-!1|-!2), >!'
+  ;; glance 'newest(todo, -=todo, -!3; 2)'
+  ;; glance 'oldest(todo, -=todo, -!3; 2)'
+  ;; glance 'random(todo, -=todo, -!3; 2)'
+ARKRC
 
         close $fh;
     }
@@ -174,6 +203,7 @@ sub load_arkrc {
         functions => {},
         inline_functions => [],
         queries => {},
+        defaults => {},
     );
 
     return %config unless -f $cfg;
@@ -241,6 +271,11 @@ sub load_arkrc {
 
             $config{queries}{$name} = $query;
             $query_name = $name;
+        }
+        elsif ($section eq "defaults") {
+            my ($name, $val) = split /\s*=\s*/, $line, 2;
+            next unless $name;
+            $config{defaults}{$name} = trim($val // "");
         }
     }
 
@@ -610,11 +645,11 @@ sub title_value {
 }
 
 sub display_meta {
-    my ($r) = @_;
+    my ($r, $colored) = @_;
 
-    return join "; ", map { $_->{raw} }
-        grep { $_->{sym} ne "id/" && $_->{raw} !~ /^id\// }
-        @{$r->{meta}};
+    my @tokens = grep { $_->{sym} ne "id/" && $_->{raw} !~ /^id\// } @{$r->{meta}};
+    return join "; ", map { $_->{raw} } @tokens unless $colored;
+    return join "; ", map { colorize_meta_token($_) } @tokens;
 }
 
 sub replace_meta_raw {
@@ -629,8 +664,8 @@ sub replace_meta_raw {
 sub remove_meta_token {
     my ($meta_ref, $token) = @_;
 
-    # Remove by metadata prefix
-    if ($token =~ /^[!%><=\$@~&]$/) {
+    # Remove by bare metadata symbol -- e.g. '#' drops every tag.
+    if ($token =~ /^[!%><=\$@~&#\^\/]$/) {
         return [
             grep { index($_->{raw}, $token) != 0 }
             @$meta_ref
@@ -714,28 +749,53 @@ sub comparison_field_needed {
 # this section is its supporting date/pattern arithmetic.
 # ============================================================
 
+# Recurring evnt instances are only materialised within the window this
+# returns (see expand_recurring_events_for_range). today/week/Nd|Nw|Nm|Ny
+# tokens set the base window; on top of that, any comparison against
+# evnt start/end (`>`/`<`) with a parseable date -- e.g. `><=+30d` or
+# `>>=20260901` -- widens the window to cover that date too, so a
+# recurring event actually gets checked against it instead of only ever
+# expanding today's instance.
 sub query_time_range {
     my ($query) = @_;
 
     my @tokens = split_query_tokens($query);
+    my ($from, $to);
 
     for my $tok (@tokens) {
+        if ($tok eq "today") {
+            ($from, $to) = (today_start_epoch(), add_interval(today_start_epoch(), 1, "d"));
+            last;
+        }
 
-        return (today_start_epoch(), add_interval(today_start_epoch(), 1, "d"))
-            if $tok eq "today";
-
-        return (today_start_epoch(), add_interval(today_start_epoch(), 7, "d"))
-            if $tok eq "week";
+        if ($tok eq "week") {
+            ($from, $to) = (today_start_epoch(), add_interval(today_start_epoch(), 7, "d"));
+            last;
+        }
 
         if ($tok =~ /^(\d+)([dwmy])$/) {
-            return (
-                today_start_epoch(),
-                add_interval(today_start_epoch(), $1, $2)
-            );
+            ($from, $to) = (today_start_epoch(), add_interval(today_start_epoch(), $1, $2));
+            last;
         }
     }
 
-    return (today_start_epoch(), add_interval(today_start_epoch(), 1, "d"));
+    ($from, $to) = (today_start_epoch(), add_interval(today_start_epoch(), 1, "d"))
+        unless defined $from;
+
+    for my $tok (@tokens) {
+        next unless $tok =~ /^[><]\s*(?:<=|>=|=|<|>)\s*(.+)$/;
+
+        my $val = relative_date_value(trim($1));
+        next unless $val =~ /^(\d{4})(\d{2})(\d{2})/;
+
+        my $epoch = date_start_epoch($1, $2, $3);
+        $from = $epoch if $epoch < $from;
+
+        my $bound = add_interval($epoch, 1, "d");
+        $to = $bound if $bound > $to;
+    }
+
+    return ($from, $to);
 }
 
 sub parse_pattern {
@@ -1642,23 +1702,180 @@ sub apply_edit_to_records {
 }
 
 # ============================================================
+# ARCHIVE
+#
+# `ark archive 'QUERY'` never deletes data: matched records are moved,
+# verbatim, out of whatever file they're currently in and appended into
+# archive/TYPE/yyyy/mm/ (grouped by the record's own ~created date, like
+# `ark tidy` groups by creation date -- falling back to today if a
+# record predates that metadata). Archived records stop showing up in
+# ordinary queries simply because archive/ isn't one of the note/todo/
+# evnt roots scan_all() looks under.
+# ============================================================
+
+sub archive_ym {
+    my ($r) = @_;
+
+    my $created = meta_value($r, "~");
+    return (substr($created, 0, 4), substr($created, 4, 2)) if $created =~ /^\d{8}/;
+
+    my @t = localtime;
+    return (sprintf("%04d", $t[5] + 1900), sprintf("%02d", $t[4] + 1));
+}
+
+sub archive_batch_path {
+    my ($type, $year, $month) = @_;
+
+    my $dir = "archive/$type/$year/$month";
+    make_path($dir);
+
+    for my $i (1 .. 999) {
+        my $path = sprintf("%s/%s_%s%s_%03d.txt", $dir, $type, $year, $month, $i);
+        return $path unless -e $path;
+    }
+
+    die "Could not create archive path for $type $year$month\n";
+}
+
+sub archive_records {
+    my (@selected) = @_;
+    return unless @selected;
+
+    my %by_path;
+    push @{$by_path{$_->{path}}}, $_ for @selected;
+
+    my %archive_groups; # type -> year -> month -> [raw record text, ...]
+    my $files_changed = 0;
+    my $files_removed = 0;
+
+    for my $path (sort keys %by_path) {
+        open my $fh, "<:encoding(UTF-8)", $path or do {
+            warn "Cannot read $path: $!\n";
+            next;
+        };
+        local $/;
+        my $text = <$fh>;
+        close $fh;
+
+        my $new_text = $text;
+
+        for my $r (@{$by_path{$path}}) {
+            my ($tmp, $ok) = replace_first($new_text, $r->{raw_block}, "");
+
+            if ($ok) {
+                $new_text = $tmp;
+
+                my ($year, $month) = archive_ym($r);
+                push @{$archive_groups{$r->{type}}{$year}{$month}}, trim($r->{raw_block}) . "\n";
+            }
+            else {
+                warn "Could not remove block from $path\n";
+            }
+        }
+
+        # Collapse the blank-line gaps removal leaves behind.
+        $new_text =~ s/\n{3,}/\n\n/g;
+        $new_text =~ s/^\s+//;
+        $new_text =~ s/\s+\z/\n/ if length trim($new_text);
+
+        if (!length trim($new_text)) {
+            unlink $path or warn "Could not delete $path: $!\n";
+            $files_removed++;
+        }
+        else {
+            open my $out, ">:encoding(UTF-8)", $path or die "Cannot write $path: $!";
+            print $out $new_text;
+            close $out;
+            $files_changed++;
+        }
+    }
+
+    my $archived_count = 0;
+
+    for my $type (sort keys %archive_groups) {
+        for my $year (sort keys %{$archive_groups{$type}}) {
+            for my $month (sort keys %{$archive_groups{$type}{$year}}) {
+                my $records_ref = $archive_groups{$type}{$year}{$month};
+                my $dst = archive_batch_path($type, $year, $month);
+
+                open my $out, ">:encoding(UTF-8)", $dst or die "Cannot write $dst: $!";
+                print $out @$records_ref;
+                close $out;
+
+                $archived_count += scalar @$records_ref;
+                print "archived " . scalar(@$records_ref) . " record(s) -> $dst\n";
+            }
+        }
+    }
+
+    print "done: $archived_count record(s) archived, $files_changed source file(s) updated, "
+        . "$files_removed source file(s) removed\n";
+    print "review with: git diff\n";
+}
+
+sub cmd_archive {
+    my ($query) = @_;
+    die "Usage: ark archive 'QUERY'\n" unless defined $query;
+
+    $query = resolve_query_alias($query);
+    my @matches = query_records($query);
+    print_query_warnings();
+
+    show_numbered(@matches);
+
+    if (!@matches) {
+        print "\nNo matches.\n";
+        return;
+    }
+
+    print "\nSelect records to archive [all/none/1,3,5-8/q]: ";
+    my $sel = <STDIN>;
+    return unless defined $sel;
+    chomp $sel;
+    $sel = trim($sel);
+
+    return if $sel =~ /^q(uit)?$/i;
+
+    my @nums = parse_selection($sel, scalar(@matches));
+
+    if (!@nums) {
+        print "No records selected.\n";
+        return;
+    }
+
+    my @selected = map { $matches[$_ - 1] } @nums;
+
+    return unless confirm(
+        "Archive " . scalar(@selected) . " selected record(s)? "
+        . "This moves them out of their current file(s) into archive/."
+    );
+
+    archive_records(@selected);
+}
+
+# ============================================================
 # GLANCE UI
 # ============================================================
 
-# Runs one step of a (possibly multi-step) query alias from .arkrc, e.g.
-# a [queries] entry like `glance 'todo, -!1'` or `edit 'todo, -=todo' set
-# '!1'`. A bare query string just prints matches; a leading `glance`/`edit`
-# routes to that command instead, so aliases can chain interactive steps.
+# Runs one step of a query action. $from_alias is true only when this
+# text came from substituting a .arkrc [queries] alias (see
+# expand_query_actions) -- ONLY THEN does a leading `glance`/`edit` route
+# to that command instead of being treated as a literal query, so that a
+# raw query you type directly (e.g. `ark 'glance meeting notes'`, meant
+# as a literal substring search) can never be mistaken for an invocation
+# of the glance/edit command just because it happens to start with that
+# word. Aliases like the default .arkrc's `report` rely on this routing
+# to chain interactive steps such as `glance 'todo, -!1'`.
 sub run_query_action {
-    my ($action) = @_;
+    my ($action, $from_alias) = @_;
     $action = trim($action);
 
-    if ($action =~ /^glance\s+(.+)$/s) {
+    if ($from_alias && $action =~ /^glance\s+(.+)$/s) {
         cmd_glance(strip_query_quotes($1));
         return;
     }
 
-    if ($action =~ /^edit\s+('.*?'|\S+)\s+(add|remove|set|replace|a|r|s|p)\s+(.+)$/s) {
+    if ($from_alias && $action =~ /^edit\s+('.*?'|\S+)\s+(add|remove|set|replace|a|r|s|p)\s+(.+)$/s) {
         my ($query, $op, $args) = ($1, $2, $3);
         $query = strip_query_quotes($query);
         my @args = map { strip_query_quotes($_) } split /\s+/, trim($args);
@@ -1697,7 +1914,7 @@ sub cmd_glance {
         show_numbered_line($i, $r, *STDERR);
 
         print STDERR "\n"
-            if $OUTPUT_MODE eq "basic"
+            if multiline_output_mode()
             && $i < @matches;
 
         $i++;
@@ -1732,7 +1949,7 @@ sub show_numbered {
         show_numbered_line($i, $r, *STDOUT);
 
         print "\n"
-            if $OUTPUT_MODE eq "basic"
+            if multiline_output_mode()
             && $i < @items;
 
         $i++;
@@ -1887,31 +2104,232 @@ sub cmd_edit_mode {
 }
 
 # ============================================================
+# COLOR
+#
+# Color is opt-out, not opt-in: on by default whenever it's safe (a real
+# terminal, not explicitly disabled), off otherwise. `pipe` mode never
+# colors, full stop, regardless of any of this -- it exists specifically
+# to guarantee plain, stable, scriptable output. ARK_COLOR=always/never
+# overrides the terminal check for the other modes; NO_COLOR (see
+# https://no-color.org) and TERM=dumb are both honoured.
+# ============================================================
+
+my %ANSI_CODE = (
+    reset => 0, bold => 1, dim => 2, strike => 9,
+    red => 31, green => 32, yellow => 33,
+    blue => 34, magenta => 35, cyan => 36, grey => 90,
+);
+
+sub color_enabled_for {
+    my ($fh) = @_;
+    return 0 if $OUTPUT_MODE eq "pipe";
+    return 0 if $OUTPUT_WRAP; # ANSI codes would throw off wrap-width math
+
+    my $force = lc($ENV{ARK_COLOR} // "");
+    return 0 if $force eq "never";
+    return 1 if $force eq "always";
+
+    return 0 if $ENV{NO_COLOR};
+    return 0 if (($ENV{TERM} // "") eq "dumb");
+    return (-t $fh) ? 1 : 0;
+}
+
+sub style {
+    my ($text, $enabled, @styles) = @_;
+    return $text unless $enabled && @styles;
+
+    my $codes = join ";", grep { defined } map { $ANSI_CODE{$_} } @styles;
+    return $codes eq "" ? $text : "\e[${codes}m$text\e[0m";
+}
+
+sub priority_style {
+    my ($val) = @_;
+    return "red"    if $val eq "1";
+    return "yellow" if $val eq "2";
+    return "grey";
+}
+
+# Overdue -> red, due today -> yellow, anything else -> unstyled. Used
+# for both todo deadlines (%) and evnt start/end (>/<).
+sub deadline_style {
+    my ($val) = @_;
+    my $day = $val;
+    $day =~ s/T.*//;
+
+    return "" unless $day =~ /^\d{8}$/;
+
+    my $today = today_ymd();
+    return "red"    if $day lt $today;
+    return "yellow" if $day eq $today;
+    return "";
+}
+
+sub type_style {
+    my ($type) = @_;
+    return "cyan"   if $type eq "todo";
+    return "green"  if $type eq "note";
+    return "blue"   if $type eq "evnt";
+    return "";
+}
+
+# Colors one metadata token according to what its symbol means; see the
+# metadata symbol table in the CONFIG header comment.
+sub colorize_meta_token {
+    my ($m) = @_;
+    my $sym = $m->{sym};
+
+    return style($m->{raw}, 1, "cyan")                          if $sym eq "#";
+    return style($m->{raw}, 1, priority_style($m->{val}))        if $sym eq "!";
+    return style($m->{raw}, 1, deadline_style($m->{val}) || "")  if $sym eq "%";
+    return style($m->{raw}, 1, $m->{val} eq "done" ? "green" : "yellow") if $sym eq "=";
+    return style($m->{raw}, 1, "bold")                           if $sym eq "/";
+    return style($m->{raw}, 1, "magenta")                        if $sym eq "^";
+    return style($m->{raw}, 1, deadline_style($m->{val}) || "blue") if $sym eq ">" || $sym eq "<";
+    return style($m->{raw}, 1, "grey")
+        if $sym eq "~" || $sym eq "&" || $sym eq "\$" || $sym eq "\@" || $sym eq "id/";
+
+    return $m->{raw};
+}
+
+# yyyymmdd[Thhmmss] -> "yyyy-mm-dd[ hh:mm]", for human-readable display.
+sub fmt_date_display {
+    my ($v) = @_;
+    return "" unless defined $v && $v =~ /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?/;
+
+    my $s = "$1-$2-$3";
+    $s .= " $4:$5" if defined $4;
+    return $s;
+}
+
+sub fmt_range_display {
+    my ($start, $end) = @_;
+    my $s = fmt_date_display($start);
+    return $s unless length $end;
+
+    my $e = fmt_date_display($end);
+
+    if (substr($start, 0, 8) eq substr($end, 0, 8) && $end =~ /T(\d{2})(\d{2})/) {
+        return "$s-$1:$2";
+    }
+
+    return "$s - $e";
+}
+
+# ============================================================
 # OUTPUT
 # ============================================================
 
 sub record_line {
-    my ($r) = @_;
+    my ($r, $colored) = @_;
 
-    my $meta = display_meta($r);
+    my $meta = display_meta($r, $colored);
     my $body = $r->{content};
 
     if ($r->{type} eq "note") {
         $body =~ s/\s+/ /g;
         $body = substr($body, 0, 160) . "..." if length($body) > 160;
     }
+    $body = trim($body);
 
-    my $line = $r->{type} . ":";
-    $line .= " " . trim($body) if length trim($body);
+    my $done = meta_value($r, "=") eq "done";
+    my $type_label = style($r->{type}, $colored, type_style($r->{type}));
+    my $body_disp  = $done ? style($body, $colored, "dim", "strike") : $body;
+
+    my $line = "$type_label:";
+    $line .= " $body_disp" if length $body;
     $line .= " {$meta}" if length $meta;
-    $line .= " [$r->{path}]";
+    $line .= " " . style("[$r->{path}]", $colored, "grey");
 
     $line =~ s/[\r\n]+/ /g;
     return trim($line);
 }
 
-# Writes one already-formatted line to $fh, honouring the active output mode:
-#   --wrap   : wrap at terminal width
+# `pretty` mode's per-record card: a bold/struck-through content line,
+# then an indented line of the fields that actually matter for reading
+# at a glance (tag, priority, status, deadline, assignee, evnt
+# start/end, recurrence) with the noisier ~created/&id omitted, plus the
+# source path so you can still find/edit the record.
+sub pretty_content_line {
+    my ($r, $colored) = @_;
+
+    my $body = $r->{content};
+    $body =~ s/\s+/ /g;
+    $body = trim($body);
+    $body = substr($body, 0, 200) . "..." if length($body) > 200;
+    $body = "(untitled $r->{type})" unless length $body;
+
+    my $done = meta_value($r, "=") eq "done";
+    my $marker = $r->{type} eq "todo" ? ($done ? "[x]" : "[ ]")
+               : $r->{type} eq "evnt" ? "*"
+               : "-";
+
+    my $marker_disp = style($marker, $colored, $done ? "green" : "grey");
+    my $body_disp   = $done ? style($body, $colored, "dim", "strike") : style($body, $colored, "bold");
+
+    return "$marker_disp $body_disp";
+}
+
+sub pretty_field_str {
+    my ($r, $colored) = @_;
+    my @parts;
+
+    my $tag = meta_value($r, "#");
+    push @parts, style("#$tag", $colored, "cyan") if length $tag;
+
+    if ($r->{type} eq "todo") {
+        my $pr = meta_value($r, "!");
+        push @parts, style("priority $pr", $colored, priority_style($pr)) if length $pr;
+
+        my $status = meta_value($r, "=");
+        push @parts, style($status, $colored, $status eq "done" ? "green" : "yellow") if length $status;
+
+        my $dl = meta_value($r, "%");
+        push @parts, style("due " . fmt_date_display($dl), $colored, deadline_style($dl) || "")
+            if length $dl;
+
+        my $as = meta_value($r, "\@");
+        push @parts, style("\@$as", $colored, "grey") if length $as;
+    }
+
+    if ($r->{type} eq "evnt") {
+        my $start = meta_value($r, ">");
+        my $end   = meta_value($r, "<");
+        push @parts, style(fmt_range_display($start, $end), $colored, deadline_style($start) || "blue")
+            if length $start;
+
+        push @parts, style("repeats", $colored, "magenta") if length meta_value($r, "^");
+    }
+
+    push @parts, style($r->{path}, $colored, "grey");
+
+    return join("  ", @parts);
+}
+
+sub render_pretty {
+    my ($r, $colored) = @_;
+
+    my $line = pretty_content_line($r, $colored);
+    my $fields = pretty_field_str($r, $colored);
+    $line .= "\n  $fields" if length $fields;
+
+    return $line;
+}
+
+# Picks record_line() or render_pretty() depending on the active output
+# mode, and resolves whether $fh should be colored.
+sub build_display_line {
+    my ($r, $fh) = @_;
+    $fh ||= *STDOUT;
+
+    my $colored = color_enabled_for($fh);
+    return render_pretty($r, $colored) if $OUTPUT_MODE eq "pretty";
+    return record_line($r, $colored);
+}
+
+# Writes one already-formatted (possibly multi-line, for pretty mode)
+# block to $fh, honouring the active output mode:
+#   pretty   : print as-is (its own layout; wrap/no-autowrap don't apply)
+#   --wrap   : wrap each line at terminal width
 #   --compact: print on a single line, bracketed in "disable/enable
 #              autowrap" terminal escapes, so long lines scroll instead
 #              of wrapping (only when $fh is a tty)
@@ -1920,8 +2338,11 @@ sub emit_line {
     my ($line, $fh) = @_;
     $fh ||= *STDOUT;
 
-    if ($OUTPUT_WRAP) {
-        print $fh wrap($line, 0) . "\n";
+    if ($OUTPUT_MODE eq "pretty") {
+        print $fh "$line\n";
+    }
+    elsif ($OUTPUT_WRAP) {
+        print $fh join("\n", map { wrap($_, 0) } split /\n/, $line) . "\n";
     }
     elsif ($OUTPUT_NO_AUTOWRAP && -t $fh) {
         print $fh "\e[?7l$line\e[?7h\n";
@@ -1933,12 +2354,22 @@ sub emit_line {
 
 sub show_numbered_line {
     my ($i, $r, $fh) = @_;
-    emit_line("[$i] " . record_line($r), $fh);
+    $fh ||= *STDOUT;
+
+    my $text = build_display_line($r, $fh);
+    my @lines = split /\n/, $text;
+    $lines[0] = "[$i] " . $lines[0];
+
+    emit_line(join("\n", @lines), $fh);
 }
 
 sub show {
     my ($r) = @_;
-    emit_line(record_line($r));
+    emit_line(build_display_line($r, *STDOUT), *STDOUT);
+}
+
+sub multiline_output_mode {
+    return $OUTPUT_MODE eq "basic" || $OUTPUT_MODE eq "pretty";
 }
 
 sub print_query_results {
@@ -1948,7 +2379,7 @@ sub print_query_results {
 
     for my $i (0 .. $#out) {
         show($out[$i]);
-        print "\n" if $OUTPUT_MODE eq "basic" && $i < $#out;
+        print "\n" if multiline_output_mode() && $i < $#out;
     }
 }
 
@@ -1964,15 +2395,25 @@ Commands:
   ark edit 'QUERY'             interactive edit mode over the matches
   ark edit 'QUERY' OP ARGS     batch edit all matches, no prompts
   ark glance 'QUERY' [...]     numbered list; choose which matches to print
+  ark archive 'QUERY'          numbered list; move chosen matches to archive/
   ark tidy [OPTS]              reformat / organise / compact record files
   ark publish                  build a static site from tagged notes
   ark help                     show this text
 
 Output modes (as a leading word, or a query word):
-  basic     blank line between results
-  compact   one result per line, no autowrap
-  wrap      wrap long lines at terminal width
-  pipe      plain, one result per line (default)
+  pipe      plain, uncolored, one result per line -- always scriptable
+            (default; also what .arkrc doesn't override, see below)
+  basic     blank line between results, colored when the terminal allows
+  compact   one result per line, no autowrap, colored when allowed
+  pretty    multi-line colored "cards": content, then tag/priority/status/
+            deadline/evnt time, with overdue dates and top priority in red
+  wrap      modifier: wrap long lines at terminal width (any mode)
+
+Color is on by default in basic/compact/pretty whenever stdout is a real
+terminal; NO_COLOR=1 or ARK_COLOR=never disable it, ARK_COLOR=always
+forces it on. `pipe` mode never colors, regardless of any of this.
+.arkrc's [defaults] output=MODE sets your preferred default; an explicit
+mode word on the command line always wins over it.
 
 Record syntax:
   todo: Buy milk {!2; #home};;
@@ -2009,6 +2450,11 @@ Query syntax (comma = AND, | = OR, parens to group):
                               oldest(...), random(...); define more in
                               .arkrc [functions] / [function NAME]
 
+A comparison against evnt start/end (>/<) with a date, e.g. `><=+30d`,
+also widens how far ahead recurring events get expanded -- otherwise
+recurring evnts only ever expand within the query's basic time window
+(today, if none of the above tokens are present).
+
 Sorting (anywhere in the query):
   >SYM / <SYM   ascending / descending by metadata SYM's value
   >> / << / >< / <>   evnt >/< sort specifically: ascending start /
@@ -2027,6 +2473,13 @@ ark add TYPE 'CONTENT':
     ark add note 'Thought about liturgy {#theology}'
     ark add evnt 'Team meeting {>20260601T1400; <20260601T1500}'
 
+ark archive 'QUERY':
+  Shows a numbered list of matches and asks which to archive
+  [all/none/1,3,5-8/q]. Selected records are moved, verbatim, out of
+  their current file into archive/TYPE/yyyy/mm/ (grouped by the
+  record's own ~created date) -- nothing is ever deleted, and archived
+  records simply stop showing up in ordinary queries.
+
 ark tidy [--clean|--tidy|--compact] [--1|--2|--3|--4] [--apply]:
   (no flags)  same as --tidy --1
   --clean     reformat records in place: add missing ~created/&id/
@@ -2035,7 +2488,9 @@ ark tidy [--clean|--tidy|--compact] [--1|--2|--3|--4] [--apply]:
   --tidy      clean, AND group loose single-line records into
               TYPE/yyyy/mm/ batch files, and multiline notes into their
               own titled file; files named with a leading _ are
-              reformatted but never moved out of
+              reformatted but never moved out of. Warns (without
+              dropping anything) if the same content appears more than
+              once in a single run -- likely an accidental double-paste.
   --compact   merge each TYPE/yyyy/mm/ directory into as few files as
               possible (max 1000 records each), deduping by id
   --1/--2/--3/--4   inbox.txt only / all loose files / all files already
@@ -2049,9 +2504,15 @@ ark publish:
 
 .arkrc (repository config, created by 'ark init'):
   [bases]         extra directories to also scan for note/todo/evnt
-  [defaults]      authour=/assignee=/tag=, used by 'ark tidy'
+  [defaults]      authour=/assignee=/tag=, used by 'ark tidy';
+                  output=MODE sets your preferred default output mode
   [queries]       name = query   reusable alias, usable as a query word;
-                  indented continuation lines extend the same alias
+                  indented continuation lines extend the same alias.
+                  ark init seeds several (overdue, duesoon, undated,
+                  high, done, backlog, upcoming, normalise, report) --
+                  see .arkrc itself or the README for what each does.
+                  Naming an alias the same as a built-in word
+                  (todo/today/edit/pipe/...) prints a warning.
   [functions]     name = path/to/file.pl   external query function file
   [function name] inline Perl body defining that query function
   [publish]       tag names to publish, one per line
@@ -2087,15 +2548,32 @@ sub load_query_functions {
     }
 }
 
+# Takes one top-level CLI query argument and returns a list of
+# { text => ..., from_alias => 0|1 } steps for run_query_action(). If the
+# whole argument names a .arkrc alias, its value is resolved (recursing
+# through nested alias references and ;;-separated steps) and every
+# resulting step is marked from_alias => 1. Otherwise the argument is
+# returned unchanged as a single from_alias => 0 step -- see
+# run_query_action for why that distinction matters.
 sub expand_query_actions {
-    my ($text, $seen_ref) = @_;
-    $seen_ref ||= {};
+    my ($text) = @_;
+    $text = trim($text);
 
+    if (exists $CONFIG{queries}{$text}) {
+        return map { { text => $_, from_alias => 1 } }
+            expand_alias_steps($text, {});
+    }
+
+    return ({ text => $text, from_alias => 0 });
+}
+
+sub expand_alias_steps {
+    my ($text, $seen_ref) = @_;
     $text = trim($text);
 
     if (exists $CONFIG{queries}{$text}) {
         die "Query alias loop involving '$text'\n" if $seen_ref->{$text}++;
-        return expand_query_actions($CONFIG{queries}{$text}, $seen_ref);
+        return expand_alias_steps($CONFIG{queries}{$text}, $seen_ref);
     }
 
     my @out;
@@ -2104,13 +2582,27 @@ sub expand_query_actions {
         $part = trim($part);
 
         if (exists $CONFIG{queries}{$part}) {
-            push @out, expand_query_actions($CONFIG{queries}{$part}, { %$seen_ref });
+            push @out, expand_alias_steps($CONFIG{queries}{$part}, { %$seen_ref });
         } else {
             push @out, $part;
         }
     }
 
     return @out;
+}
+
+# Warns (does not block anything) when a .arkrc [queries] alias name
+# collides with a word that already means something on its own -- e.g.
+# an alias named "today" would silently take over whenever the user
+# types `ark today`, hiding the built-in meaning. Flagged in inbox.txt
+# as a real gap; this at least surfaces it instead of silent shadowing.
+sub warn_on_alias_collisions {
+    my %reserved = map { $_ => 1 } @RESERVED_WORDS;
+
+    for my $name (sort keys %{$CONFIG{queries}}) {
+        warn "warning: query alias '$name' shadows a built-in word/command of the same name\n"
+            if $reserved{$name};
+    }
 }
 
 sub resolve_query_alias {
@@ -2176,7 +2668,7 @@ sub dispatch_command {
 
     return 0 unless defined $cmd && length $cmd;
 
-    my %builtins = map { $_ => 1 } qw(help init edit glance basic compact pipe pretty wrap);
+    my %builtins = map { $_ => 1 } qw(help init edit glance archive basic compact pipe pretty wrap);
     return 0 if $builtins{$cmd};
 
     my $script_dir = ark_script_dir();
@@ -2208,15 +2700,22 @@ sub dispatch_command {
 my $cmd = $ARGV[0] // "";
 
 while (1) {
-    if ($cmd eq "--basic" || $cmd eq "basic" || $cmd eq "pretty") {
+    if ($cmd eq "--basic" || $cmd eq "basic") {
         $OUTPUT_MODE = "basic";
+        $OUTPUT_MODE_EXPLICIT = 1;
     }
     elsif ($cmd eq "--compact" || $cmd eq "compact") {
         $OUTPUT_MODE = "compact";
         $OUTPUT_NO_AUTOWRAP = 1;
+        $OUTPUT_MODE_EXPLICIT = 1;
+    }
+    elsif ($cmd eq "--pretty" || $cmd eq "pretty") {
+        $OUTPUT_MODE = "pretty";
+        $OUTPUT_MODE_EXPLICIT = 1;
     }
     elsif ($cmd eq "--pipe" || $cmd eq "pipe") {
         $OUTPUT_MODE = "pipe";
+        $OUTPUT_MODE_EXPLICIT = 1;
     }
     elsif ($cmd eq "--wrap" || $cmd eq "wrap") {
         $OUTPUT_WRAP = 1;
@@ -2258,6 +2757,18 @@ if (dispatch_command($cmd, @ARGV[1 .. $#ARGV])) {
 # so .arkrc is read from the repository root.
 %CONFIG = load_arkrc();
 @BASES = @{$CONFIG{bases}};
+warn_on_alias_collisions();
+
+# .arkrc's [defaults] output= sets a preferred default mode, but only
+# when the user didn't already ask for one explicitly on the command line.
+if (!$OUTPUT_MODE_EXPLICIT) {
+    my $cfg_mode = lc($CONFIG{defaults}{output} // "");
+
+    if ($cfg_mode =~ /^(pipe|basic|compact|pretty)$/) {
+        $OUTPUT_MODE = $cfg_mode;
+        $OUTPUT_NO_AUTOWRAP = 1 if $cfg_mode eq "compact";
+    }
+}
 
 load_builtin_arkfuncs();
 load_query_functions();
@@ -2288,6 +2799,12 @@ if ($cmd eq "glance") {
     exit;
 }
 
+if ($cmd eq "archive") {
+    shift @ARGV;
+    cmd_archive(shift @ARGV);
+    exit;
+}
+
 if (!@ARGV) {
     usage();
     exit;
@@ -2300,6 +2817,6 @@ for my $qi (0 .. $#queries) {
 
     for my $ai (0 .. $#actions) {
         print "\n" if $qi > 0 || $ai > 0;
-        run_query_action($actions[$ai]);
+        run_query_action($actions[$ai]{text}, $actions[$ai]{from_alias});
     }
 }
