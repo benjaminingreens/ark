@@ -7,6 +7,21 @@ use File::Path qw(make_path remove_tree);
 use File::Basename qw(dirname basename);
 use Cwd qw(abs_path getcwd);
 
+# ============================================================
+# `ark publish` builds a static HTML site under docs/ from note: records:
+#   1. read .arkrc's [publish] tag list (required) and defaults.no_publish
+#      (an opt-out tag, default "no_publish")
+#   2. scan every note record; a note is published once per [publish] tag
+#      it carries, unless it also carries the no_publish tag
+#   3. render one page per published note (its body run through a small
+#      built-in markdown dialect), one index page per tag, and a site
+#      index linking the tags that have any notes
+#   4. wrap every page in a template -- .ark/publish.html if present,
+#      else the built-in default() below -- and write shared CSS once
+#
+# docs/ is wiped and rebuilt from scratch on every run.
+# ============================================================
+
 binmode(STDOUT, ":encoding(UTF-8)");
 binmode(STDERR, ":encoding(UTF-8)");
 
@@ -716,6 +731,9 @@ sub breadcrumb_html {
          . '</span>';
 }
 
+# Lighter-weight inline formatter used only inside ---csv table cells
+# (bold/italic/links, no backslash-escaping or _underscore_ emphasis);
+# see inline() below for the fuller version used everywhere else.
 sub inline_markdown {
     my ($text) = @_;
 

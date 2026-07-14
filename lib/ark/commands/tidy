@@ -10,6 +10,36 @@ use POSIX qw(strftime);
 binmode(STDOUT, ":encoding(UTF-8)");
 binmode(STDERR, ":encoding(UTF-8)");
 
+# ============================================================
+# `ark tidy` combines one operation with one level. Nothing is written
+# to disk unless --apply is given (a dry run always prints what it would
+# do).
+#
+# Operations:
+#   --clean    reformat records in place: fill in missing ~created/&id/
+#              $authour/#tag (todo also gets =status/!priority/@assignee)
+#              and put metadata tokens in a consistent order. Never moves
+#              a record to a different file.
+#   --tidy     clean, AND group loose single-line records out of whatever
+#              file they were found in into TYPE/yyyy/mm/ batch files;
+#              multiline notes get their own file (named after /title, or
+#              a timestamp if untitled). Files named with a leading `_`
+#              are reformatted in place but never emptied/moved out of.
+#   --compact  within each TYPE/yyyy/mm/ directory, merge all files back
+#              into as few files as possible (max 1000 records each),
+#              dropping duplicate records (matched by &id, else by exact
+#              text). Skips any month containing a multiline note, since
+#              those can't be safely concatenated line-by-line.
+#   (none)     same as --tidy --1
+#
+# Levels select which files an operation is allowed to touch:
+#   --1  inbox.txt only (default)
+#   --2  all "loose" files (anything not already inside a
+#        TYPE/yyyy/mm/ directory)
+#   --3  files already inside a TYPE/yyyy/mm/ directory
+#   --4  everything
+# ============================================================
+
 my $APPLY   = has_arg("--apply");
 my $CLEAN   = has_arg("--clean");
 my $TIDY    = has_arg("--tidy");
@@ -36,8 +66,6 @@ if ($TIDY && $CLEAN) {
 
 my $RUN_STAMP = strftime("%Y%m%dT%H%M%S", localtime);
 my $DATE_ID   = strftime("%Y%m%d%H%M%S", localtime);
-my $YEAR      = substr($RUN_STAMP, 0, 4);
-my $MONTH     = substr($RUN_STAMP, 4, 2);
 
 my %TYPE_DIR = (
     note => "note",

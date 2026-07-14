@@ -1,0 +1,62 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use utf8;
+
+binmode(STDOUT, ":encoding(UTF-8)");
+binmode(STDERR, ":encoding(UTF-8)");
+
+# ============================================================
+# `ark add TYPE CONTENT` appends a record to inbox.txt using the same
+# "type: content {meta};;" syntax the rest of ark reads, so anything
+# added here is picked up by queries immediately and filed away properly
+# by the next `ark tidy --apply`. This command does no normalisation of
+# its own (no auto ~created/&id/etc) -- that is tidy's job.
+# ============================================================
+
+my %valid_type = map { $_ => 1 } qw(todo note evnt);
+
+sub usage {
+    print STDERR <<'EOF';
+Usage: ark add TYPE 'CONTENT {meta; meta}'
+  TYPE is one of: todo, note, evnt
+  CONTENT is appended verbatim as "TYPE: CONTENT;;" to inbox.txt.
+  Quote CONTENT as one argument if it contains a {meta} block, so the
+  shell doesn't split or brace-expand it.
+
+Examples:
+  ark add todo 'Buy milk {#home; !2}'
+  ark add todo Call Mum
+  ark add note 'Thought about liturgy {#theology}'
+  ark add evnt 'Team meeting {>20260601T1400; <20260601T1500; #work}'
+
+Run 'ark tidy --apply' afterwards to file the record away.
+EOF
+}
+
+my ($type, @rest) = @ARGV;
+
+if (!defined $type || !$valid_type{$type} || !@rest) {
+    usage();
+    exit 1;
+}
+
+my $content = join " ", @rest;
+$content =~ s/^\s+|\s+$//g;
+
+if (!length $content) {
+    print STDERR "ark add: content cannot be empty\n";
+    exit 1;
+}
+
+if ($content =~ /;;/) {
+    print STDERR "ark add: content must not contain ';;'\n";
+    exit 1;
+}
+
+open my $fh, ">>:encoding(UTF-8)", "inbox.txt"
+    or die "Cannot open inbox.txt: $!\n";
+print $fh "$type: $content;;\n";
+close $fh;
+
+print "added to inbox.txt: $type: $content;;\n";

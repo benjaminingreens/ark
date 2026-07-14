@@ -12,6 +12,20 @@ binmode(STDERR, ":encoding(UTF-8)");
 
 # ============================================================
 # CONFIG
+#
+# Records are lines of the form:
+#   type: content {meta; meta; ...};;
+# where type is one of note/todo/evnt and each meta token is a single
+# leading symbol plus a value:
+#
+#   #  tag              !  priority          %  deadline
+#   =  status            $  authour           @  assignee
+#   /  title             ~  created           &  id
+#   >  start (evnt)       <  end (evnt)        ^  recurrence pattern (evnt)
+#
+# See metadata handling below (parse_meta / meta_value / display_meta) and
+# the query engine further down for how these are matched, compared, and
+# sorted on.
 # ============================================================
 
 my @TYPES = qw(note todo evnt);
@@ -24,8 +38,6 @@ my $SHOW_PROGRESS = -t STDERR
     && !$ENV{ARK_NO_PROGRESS}
     && (($ENV{TERM} // "") ne "dumb");
 my $last_progress_pct = -1;
-my $shown_count = 0;
-my $NEEDS_LEADING_BLANK = 0;
 my $OUTPUT_MODE = "pipe"; # pipe | basic | compact
 my $OUTPUT_WRAP = 0;
 my $OUTPUT_NO_AUTOWRAP = 0;
@@ -99,6 +111,11 @@ sub find_ark_root {
     return "";
 }
 
+# Query functions look like `name(inner_query; arg)`, e.g. `newest(todo; 3)`.
+# They run inner_query themselves (via the $run_query callback) and return
+# a filtered/reordered subset of @records for the outer query to continue
+# matching against. Built-ins live in arkfuncs.pl (newest/oldest/random);
+# more can be added via [functions] or inline [function NAME] in .arkrc.
 sub eval_query_function {
     my ($expr) = @_;
 
@@ -140,6 +157,15 @@ sub expand_base_path {
     return $path;
 }
 
+# Parses .arkrc, a small ini-style config with these sections:
+#   [bases]            one extra search directory per line
+#   [defaults]         authour=/assignee=/tag= used by `ark tidy`
+#   [queries]          name = query, where indented continuation lines
+#                      (e.g. `;; alt query`) are appended to the same alias
+#   [functions]        name = path/to/file.pl (require'd, must define
+#                      arkfunc_NAME)
+#   [function NAME]    inline Perl body for arkfunc_NAME, read verbatim
+#                      until the next [section]
 sub load_arkrc {
     my $cfg = ".arkrc";
 
@@ -671,6 +697,21 @@ sub comparison_field_needed {
 
 # ============================================================
 # RECURRENCE / PATTERN ENGINE
+#
+# An evnt's `^` metadata is a recurrence pattern applied to its `>` start
+# time, e.g. `^1w@wd1-5@h9+3h`:
+#   1w          repeat every 1 week (also: y/m/d; combine like `1m2w`)
+#   @wd1-5      only on ISO weekdays 1-5 (Mon-Fri); also @m (day of month),
+#               @h (hour), @n (minute) -- comma/range lists like `h9,13-15`
+#   ~SELECTOR   exclude instances matching SELECTOR (same syntax as @)
+#   +3h         each instance lasts 3 hours (default: 3h if the start has
+#               a time-of-day, else a full day)
+#   .           (leading dot) anchor the interval to the 1st of the
+#               start's month/year instead of the start date itself
+#
+# expand_recurring_events_for_range() materialises concrete instances of
+# every recurring evnt within a queried time window; everything else in
+# this section is its supporting date/pattern arithmetic.
 # ============================================================
 
 sub query_time_range {
@@ -1055,11 +1096,32 @@ sub load_records {
     @records = ();
     $last_progress_pct = -1;
     scan_all();
-    progress_done();
 }
 
 # ============================================================
 # QUERY
+#
+# A query is one or more comma-separated conditions, ANDed together;
+# `|` (at top level, or inside parens) ORs whole groups. matches_one()
+# dispatches each individual condition:
+#
+#   todo / note / evnt      record type
+#   text                    substring match against content + raw meta
+#   -SYM                    has metadata SYM present, e.g. `-#` has a tag
+#   --SYM                   metadata SYM absent
+#   -TEXT                   alias for a plain substring/alternation match
+#   --TEXT                  negation of the above
+#   SYM<=VAL, SYM>=VAL, ...
+#     SYM=VAL, SYM<VAL, SYM>VAL
+#                           comparison on a metadata value (! numeric,
+#                           % dates incl. relative like +2w/today, others
+#                           lexical)
+#   today / week / Nd|Nw|Nm|Ny
+#                           evnt only: start time falls in that window
+#
+# Sorting/dedup tokens (>SYM, <SYM, >>, <<, ><, <>) are stripped out of
+# the query text by query_records() before matching and applied
+# afterwards by sort_records().
 # ============================================================
 
 sub parse_query_raw {
@@ -1389,7 +1451,12 @@ sub sort_records {
         my $dir = substr($s, 0, 1);
         my $key = substr($s, 1);
 
-        # Special case:
+        # >/< are themselves metadata symbols (evnt start/end), which
+        # collides with using them as sort direction prefixes below. So
+        # sorting BY start/end time needs a two-char token instead:
+        #   >> ascending start   << descending end
+        #   >< ascending end     <> descending start
+        # (first char = direction, second char = which of >/< to sort by)
         if ($s eq ">>" || $s eq "<>" || $s eq "><" || $s eq "<<") {
             my $sym  = substr($s, 1, 1);
             my $desc = substr($s, 0, 1) eq "<";
@@ -1437,6 +1504,18 @@ sub sort_records {
 
 # ============================================================
 # EDITING CORE
+#
+# Four metadata operations, each usable by full name or single-letter
+# alias (add/a, remove/r, set/s, replace/p):
+#   add TOKEN       append TOKEN unless already present
+#   remove TOKEN    drop any token matching TOKEN (supports SYM or
+#                   "prefix*" wildcard forms, see remove_meta_token)
+#   set TOKEN       replace whatever token(s) share TOKEN's symbol
+#   replace OLD NEW swap one exact raw token for another
+#
+# Edits are applied by rewriting each record's raw_block in place and
+# splicing it back into the source file text (apply_edit_to_records),
+# so anything outside {..} blocks is left untouched.
 # ============================================================
 
 sub update_block_meta {
@@ -1562,65 +1641,14 @@ sub apply_edit_to_records {
     print "review with: git diff\n";
 }
 
-sub apply_single_edit_to_records {
-    my ($records_ref, $op, @args) = @_;
-    my @selected = @$records_ref;
-
-    return unless @selected;
-
-    my %by_path;
-    push @{$by_path{$_->{path}}}, $_ for @selected;
-
-    my $files_changed = 0;
-    my $records_changed = 0;
-
-    for my $path (sort keys %by_path) {
-        open my $fh, "<:encoding(UTF-8)", $path or do {
-            warn "Cannot read $path: $!\n";
-            next;
-        };
-        local $/;
-        my $text = <$fh>;
-        close $fh;
-
-        my $new_text = $text;
-        my $file_changed = 0;
-
-        for my $r (@{$by_path{$path}}) {
-            my $new_block = edited_block(
-                $r,
-                [
-                    [$op, @args]
-                ]
-            );
-            my ($tmp, $ok) = replace_first($new_text, $r->{raw_block}, $new_block);
-
-            if ($ok) {
-                $new_text = $tmp;
-                $file_changed = 1;
-                $records_changed++;
-            } else {
-                warn "Could not replace block in $path\n";
-            }
-        }
-
-        if ($file_changed && $new_text ne $text) {
-            open my $out, ">:encoding(UTF-8)", $path or die "Cannot write $path: $!";
-            print $out $new_text;
-            close $out;
-            print "updated $path\n";
-            $files_changed++;
-        }
-    }
-
-    print "done: $records_changed record(s), $files_changed file(s) changed\n";
-    print "review with: git diff\n";
-}
-
 # ============================================================
 # GLANCE UI
 # ============================================================
 
+# Runs one step of a (possibly multi-step) query alias from .arkrc, e.g.
+# a [queries] entry like `glance 'todo, -!1'` or `edit 'todo, -=todo' set
+# '!1'`. A bare query string just prints matches; a leading `glance`/`edit`
+# routes to that command instead, so aliases can chain interactive steps.
 sub run_query_action {
     my ($action) = @_;
     $action = trim($action);
@@ -1661,8 +1689,6 @@ sub cmd_glance {
     $query = resolve_query_alias($query);
 
     my @matches = query_records($query);
-
-    print_query_header($query, scalar(@matches), "result", *STDERR);
 
     return unless @matches;
 
@@ -1884,66 +1910,35 @@ sub record_line {
     return trim($line);
 }
 
-sub print_line {
-    my ($line) = @_;
-
-    if ($OUTPUT_WRAP) {
-        print wrap($line, 0) . "\n";
-        return;
-    }
-
-    if ($OUTPUT_NO_AUTOWRAP && -t STDOUT) {
-        print "\e[?7l";
-        print "$line";
-        print "\e[?7h";
-        print "\n";
-        return;
-    }
-
-    print "$line\n";
-}
-
-sub show_numbered_line {
-    my ($i, $r, $fh) = @_;
+# Writes one already-formatted line to $fh, honouring the active output mode:
+#   --wrap   : wrap at terminal width
+#   --compact: print on a single line, bracketed in "disable/enable
+#              autowrap" terminal escapes, so long lines scroll instead
+#              of wrapping (only when $fh is a tty)
+#   default  : print as-is
+sub emit_line {
+    my ($line, $fh) = @_;
     $fh ||= *STDOUT;
-
-    my $line = "[$i] " . record_line($r);
 
     if ($OUTPUT_WRAP) {
         print $fh wrap($line, 0) . "\n";
     }
     elsif ($OUTPUT_NO_AUTOWRAP && -t $fh) {
-        print $fh "\e[?7l";
-        print $fh "$line";
-        print $fh "\e[?7h";
-        print $fh "\n";
+        print $fh "\e[?7l$line\e[?7h\n";
     }
     else {
         print $fh "$line\n";
     }
 }
 
-sub show {
-    my ($r) = @_;
-
-    my $line = record_line($r);
-
-    if ($OUTPUT_WRAP) {
-        print wrap($line, 0) . "\n";
-    }
-    elsif ($OUTPUT_NO_AUTOWRAP && -t STDOUT) {
-        print "\e[?7l";
-        print "$line";
-        print "\e[?7h";
-        print "\n";
-    }
-    else {
-        print "$line\n";
-    }
+sub show_numbered_line {
+    my ($i, $r, $fh) = @_;
+    emit_line("[$i] " . record_line($r), $fh);
 }
 
-sub print_query_header {
-    return;
+sub show {
+    my ($r) = @_;
+    emit_line(record_line($r));
 }
 
 sub print_query_results {
@@ -1960,29 +1955,106 @@ sub print_query_results {
 sub usage {
     print <<"EOF";
 Usage:
-  ark 'todo'
-  ark 'note'
-  ark 'evnt'
-  ark 'evnt, today'
-  ark 'evnt, -^*'
-  ark 'todo, -#jesse'
-  ark 'todo, --!1'
-  ark 'todo, -!1'
-  ark 'todo, >!1'
+  ark 'QUERY'                  run a query, print matching records
+  ark 'QUERY1' 'QUERY2' ...    run several queries/aliases in sequence
 
-Edit mode:
-  ark edit 'todo, -#jesse'
+Commands:
+  ark init                     initialise an ark repository here
+  ark add TYPE 'CONTENT'       append a record to inbox.txt
+  ark edit 'QUERY'             interactive edit mode over the matches
+  ark edit 'QUERY' OP ARGS     batch edit all matches, no prompts
+  ark glance 'QUERY' [...]     numbered list; choose which matches to print
+  ark tidy [OPTS]              reformat / organise / compact record files
+  ark publish                  build a static site from tagged notes
+  ark help                     show this text
 
-Direct batch edit:
-  ark edit 'todo, -#jesse' add '#family'
-  ark edit 'todo, -#jesse' remove '#jesse'
-  ark edit 'todo, -#jesse' set '=done'
-  ark edit 'todo, -#jesse' replace '#jesse' '#family'
+Output modes (as a leading word, or a query word):
+  basic     blank line between results
+  compact   one result per line, no autowrap
+  wrap      wrap long lines at terminal width
+  pipe      plain, one result per line (default)
 
-Syntax:
-  todo content {#tag !1 =todo %20260530};;
-  evnt content {#tag >20260530T1400 <20260530T1500 ^1w\@wd1-5\@h9+3h};;
-  note content {#tag /title};;
+Record syntax:
+  todo: Buy milk {!2; #home};;
+  note: Thought about liturgy {#theology};;
+  evnt: Team meeting {>20260601T1400; <20260601T1500; #work};;
+  todo: Call Mum;;                     (metadata is optional)
+
+Metadata symbols (';'-separated inside {...}):
+  #tag        !priority     %deadline    =status
+  \$authour    \@assignee     /title       ~created
+  &id         >start (evnt) <end (evnt)  ^recurrence (evnt)
+
+evnt recurrence pattern (^ metadata), e.g. ^1w\@wd1-5\@h9+3h:
+  1w            repeat every 1 week (also y/m/d; combinable, e.g. 1m2w)
+  \@wd1-5        only ISO weekdays 1-5 (also \@m day-of-month, \@h hour,
+                \@n minute; comma/range lists like \@h9,13-15)
+  ~SELECTOR     exclude instances matching SELECTOR (same syntax as \@)
+  +3h           each instance lasts 3h (default: 3h if start has a
+                time-of-day, else a full day)
+  . (leading)   anchor the interval to the 1st of the start month/year
+
+Query syntax (comma = AND, | = OR, parens to group):
+  todo | note | evnt          match record type
+  text                        substring match on content + metadata
+  -text / --text              same, or negated
+  -SYM                        has metadata SYM (e.g. -# has a tag)
+  --SYM                       metadata SYM absent
+  SYM=VAL  SYM<VAL  SYM>VAL
+  SYM<=VAL SYM>=VAL           compare a metadata value
+                              (! numeric; % dates, incl. relative +2w/today;
+                              others lexical)
+  today | week | Nd|Nw|Nm|Ny  evnt only: starts within that window
+  fn(QUERY; ARG)              query function, e.g. newest(todo; 3),
+                              oldest(...), random(...); define more in
+                              .arkrc [functions] / [function NAME]
+
+Sorting (anywhere in the query):
+  >SYM / <SYM   ascending / descending by metadata SYM's value
+  >> / << / >< / <>   evnt >/< sort specifically: ascending start /
+                       descending end / ascending end / descending start
+
+Edit operations (full name or single-letter alias):
+  add/a TOKEN     append TOKEN unless present
+  remove/r TOKEN  drop matching token(s) (TOKEN, "SYM", or "prefix*")
+  set/s TOKEN     replace whatever shares TOKEN's symbol
+  replace/p OLD NEW   swap one exact token for another
+
+ark add TYPE 'CONTENT':
+  Appends "TYPE: CONTENT;;" to inbox.txt. CONTENT may include a
+  {meta; meta} block. Run 'ark tidy --apply' afterwards to file it away.
+    ark add todo 'Buy milk {#home; !2}'
+    ark add note 'Thought about liturgy {#theology}'
+    ark add evnt 'Team meeting {>20260601T1400; <20260601T1500}'
+
+ark tidy [--clean|--tidy|--compact] [--1|--2|--3|--4] [--apply]:
+  (no flags)  same as --tidy --1
+  --clean     reformat records in place: add missing ~created/&id/
+              \$authour/#tag (todo also gets =status/!priority/\@assignee),
+              order metadata consistently
+  --tidy      clean, AND group loose single-line records into
+              TYPE/yyyy/mm/ batch files, and multiline notes into their
+              own titled file; files named with a leading _ are
+              reformatted but never moved out of
+  --compact   merge each TYPE/yyyy/mm/ directory into as few files as
+              possible (max 1000 records each), deduping by id
+  --1/--2/--3/--4   inbox.txt only / all loose files / all files already
+              under TYPE/yyyy/mm/ / everything (default: --1)
+  --apply     write changes (omit for a dry run)
+
+ark publish:
+  Builds a static HTML site in docs/ from notes tagged with any tag
+  listed under .arkrc's [publish] section (skipping any note also
+  tagged with defaults.no_publish, default "no_publish").
+
+.arkrc (repository config, created by 'ark init'):
+  [bases]         extra directories to also scan for note/todo/evnt
+  [defaults]      authour=/assignee=/tag=, used by 'ark tidy'
+  [queries]       name = query   reusable alias, usable as a query word;
+                  indented continuation lines extend the same alias
+  [functions]     name = path/to/file.pl   external query function file
+  [function name] inline Perl body defining that query function
+  [publish]       tag names to publish, one per line
 EOF
 }
 
@@ -2094,6 +2166,11 @@ sub load_builtin_arkfuncs {
     die "Could not find arkfuncs.pl\n";
 }
 
+# Any command not in the builtin set (help/init/edit/glance/output-mode
+# words) is looked up as an executable file named $cmd in one of the
+# commands/ directories below and exec'd directly -- this is how tidy,
+# publish, and add are implemented, as standalone scripts rather than
+# code in this file. First match wins.
 sub dispatch_command {
     my ($cmd, @args) = @_;
 
