@@ -87,6 +87,9 @@ for alias in overdue duesoon undated high done backlog upcoming normalise report
     assert_contains "default .arkrc defines '$alias'" "$arkrc" "$alias ="
 done
 
+assert_contains "default .arkrc sets the #= tag default" "$arkrc" "#=general"
+assert_contains "default .arkrc sets unclaimed=" "$arkrc" "unclaimed=#"
+
 # ------------------------------------------------------------
 # add
 # ------------------------------------------------------------
@@ -152,6 +155,64 @@ out="$("$ARK_BIN" 'todo, %<=today')"
 assert_contains "comparison warns about records missing the field" "$out" "missing '%'"
 
 # ------------------------------------------------------------
+# metadata grammar: canonical / named key:value / unclaimed
+# ------------------------------------------------------------
+"$ARK_BIN" add todo 'Prep sermon {time:00:10; sermon; #real}' >/dev/null
+"$ARK_BIN" add todo 'Colon in a canonical value {$team:backend; #canon}' >/dev/null
+"$ARK_BIN" add todo 'New symbol keeps its colon value {+5:6; #plus}' >/dev/null
+
+# records only become queryable once tidy files them out of inbox.txt,
+# and tidy (with no explicit --clean/--tidy/--compact) also crystallises
+# unclaimed tokens, so one plain `tidy --apply` covers all of this.
+"$ARK_BIN" tidy --apply >/dev/null
+
+out="$("$ARK_BIN" 'todo, -#real')"
+assert_contains "named key:value token round-trips" "$out" "time:00:10"
+assert_contains "tidy crystallises an unclaimed token into #tag" "$out" "#sermon"
+
+out="$("$ARK_BIN" 'todo, -#canon')"
+assert_contains "canonical token keeps a colon in its own value intact" "$out" "\$team:backend"
+
+out="$("$ARK_BIN" 'todo, -#plus')"
+assert_contains "non-canonical leading char + colon is a named field, not a symbol" "$out" "+5:6"
+
+# ------------------------------------------------------------
+# query language: named keys (comparison / presence / sort / remove)
+# ------------------------------------------------------------
+"$ARK_BIN" add todo 'Short chore {time:00:05; #chores}' >/dev/null
+"$ARK_BIN" add todo 'Long chore {time:01:30; #chores}' >/dev/null
+"$ARK_BIN" add todo 'Undated chore {#chores}' >/dev/null
+"$ARK_BIN" tidy --apply >/dev/null
+
+out="$("$ARK_BIN" 'todo, -#chores, time>00:10')"
+assert_contains "named-key comparison matches" "$out" "Long chore"
+assert_not_contains "named-key comparison excludes lower values" "$out" "Short chore"
+
+out="$("$ARK_BIN" 'todo, -#chores, time>00:10')"
+assert_contains "named-key comparison warns about records missing the field" "$out" "missing 'time'"
+
+out="$("$ARK_BIN" 'todo, -#chores, -time:')"
+assert_contains "named-key presence check" "$out" "Short chore"
+assert_contains "named-key presence check" "$out" "Long chore"
+assert_not_contains "named-key presence check excludes fieldless records" "$out" "Undated chore"
+
+out="$("$ARK_BIN" 'todo, -#chores, --time:')"
+assert_contains "named-key absence check" "$out" "Undated chore"
+assert_not_contains "named-key absence check excludes fielded records" "$out" "Short chore"
+
+out="$("$ARK_BIN" 'todo, -#chores, -time:, >time')"
+first_line="$(head -n1 <<<"$out")"
+assert_contains "named-key ascending sort puts smaller value first" "$first_line" "Short chore"
+
+out="$("$ARK_BIN" 'todo, -#chores, -time:, <time')"
+first_line="$(head -n1 <<<"$out")"
+assert_contains "named-key descending sort puts larger value first" "$first_line" "Long chore"
+
+ARK_YES=1 "$ARK_BIN" edit 'todo, -#chores, -time:' remove 'time' >/dev/null
+out="$("$ARK_BIN" 'todo, -#chores')"
+assert_not_contains "bare named-key remove drops the field by exact key" "$out" "time:"
+
+# ------------------------------------------------------------
 # recurring events + date-window widening
 # ------------------------------------------------------------
 mkdir -p evnt/2026/06
@@ -163,10 +224,14 @@ out="$("$ARK_BIN" 'evnt, -#work')"
 n=$(grep -c "Weekly standup" <<<"$out")
 assert_eq "recurrence: default window is today-only" "1" "$n"
 
-out="$("$ARK_BIN" 'evnt, -#work, ><=20260801')"
+# Relative, not absolute: a hardcoded future bound decays into a
+# shrinking (and eventually negative) window as real time passes it,
+# which is exactly what made this test flaky. +60d is always ~60 days
+# out from whenever the suite actually runs.
+out="$("$ARK_BIN" 'evnt, -#work, ><=+60d')"
 n=$(grep -c "Weekly standup" <<<"$out")
 if [ "$n" -gt 5 ]; then ok; else
-    bad "recurrence: absolute date comparison widens expansion window (got $n instances)"
+    bad "recurrence: relative date comparison widens expansion window (got $n instances)"
 fi
 
 # ------------------------------------------------------------
@@ -293,6 +358,45 @@ assert_contains "publish reports counts" "$out" "Published"
 [ -f docs/assets/publish.css ] && ok || bad "publish writes shared CSS"
 found_note_page=$(find docs/notes -name '*.html' 2>/dev/null | wc -l)
 if [ "$found_note_page" -ge 1 ]; then ok; else bad "publish writes at least one note page"; fi
+
+# ------------------------------------------------------------
+# .arkrc backward compatibility + self-healing append
+# ------------------------------------------------------------
+OLD="$(mktemp -d)"
+cd "$OLD"
+mkdir -p .ark note todo evnt
+echo "ark repository" > .ark/repo
+cat > .arkrc <<'EOF'
+[bases]
+.
+
+[defaults]
+authour=
+assignee=
+tag=general
+
+[queries]
+overdue = todo, --=done, %<today
+EOF
+
+"$ARK_BIN" add todo 'legacy config test' >/dev/null
+"$ARK_BIN" tidy --clean --apply >/dev/null
+inbox="$(cat inbox.txt)"
+assert_contains "old-style tag= still drives the default tag" "$inbox" "#general"
+
+"$ARK_BIN" todo >/dev/null 2>&1
+arkrc="$(cat .arkrc)"
+assert_contains "unclaimed= gets appended to an old .arkrc" "$arkrc" "unclaimed=#"
+assert_contains "old-style tag= is left untouched, not renamed" "$arkrc" "tag=general"
+assert_not_contains "no duplicate #= is added when tag= already covers it" "$arkrc" "#=general"
+
+before_count=$(grep -c '^unclaimed=' .arkrc)
+"$ARK_BIN" todo >/dev/null 2>&1
+after_count=$(grep -c '^unclaimed=' .arkrc)
+assert_eq "appending unclaimed= is idempotent" "$before_count" "$after_count"
+
+cd "$WORK"
+rm -rf "$OLD"
 
 # ------------------------------------------------------------
 echo

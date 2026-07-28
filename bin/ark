@@ -15,18 +15,37 @@ binmode(STDERR, ":encoding(UTF-8)");
 #
 # Records are lines of the form:
 #   type: content {meta; meta; ...};;
-# where type is one of note/todo/evnt and each meta token is a single
-# leading symbol plus a value:
+# where type is one of note/todo/evnt. Each meta token is one of:
 #
-#   #  tag              !  priority          %  deadline
-#   =  status            $  authour           @  assignee
-#   /  title             ~  created           &  id
-#   >  start (evnt)       <  end (evnt)        ^  recurrence pattern (evnt)
+#   1. Canonical -- first char is one of the fixed 12 below, value is
+#      everything after it (colons included, verbatim):
+#        #  tag              !  priority          %  deadline
+#        =  status            $  authour           @  assignee
+#        /  title             ~  created           &  id
+#        >  start (evnt)       <  end (evnt)        ^  recurrence (evnt)
+#      This set is closed; it does not grow.
 #
-# See metadata handling below (parse_meta / meta_value / display_meta) and
-# the query engine further down for how these are matched, compared, and
-# sorted on.
+#   2. Named -- first char isn't canonical, and the token contains a
+#      colon: key is everything before the FIRST colon, value is
+#      everything after, e.g. `time:00:10`.
+#
+#   3. Unclaimed -- first char isn't canonical, no colon at all: the
+#      whole token becomes the value of whatever key .arkrc's
+#      [defaults] unclaimed= names ('#' if unset), e.g. a bare `sermon`
+#      token is exactly equivalent to `#sermon`.
+#
+# parse_meta/parse_meta_token (in lib/ark/core.pl, shared with the
+# lib/ark/commands/* scripts) implement this grammar; see meta_value /
+# display_meta below and the query engine further down for how the
+# results are matched, compared, and sorted on.
 # ============================================================
+
+# A named metadata key, as it may appear directly in query syntax
+# (comparisons, presence checks, sort tokens, `edit ... remove`). Kept
+# deliberately narrower than the metadata grammar itself (which accepts
+# any non-canonical leading character) so query syntax stays
+# unambiguous: only identifier-shaped names are recognized here.
+our $NAMED_KEY_RE = qr/[A-Za-z_][A-Za-z0-9_-]*/;
 
 # Words that mean something as a whole top-level query argument on their
 # own (record types, time windows, commands, output modes). A [queries]
@@ -39,7 +58,10 @@ my @RESERVED_WORDS = qw(
 );
 
 my @TYPES = qw(note todo evnt);
+load_ark_core();
+our $UNCLAIMED_KEY; # defined in lib/ark/core.pl, set below
 my %CONFIG = load_arkrc();
+$UNCLAIMED_KEY = resolve_unclaimed_key(%CONFIG);
 my @BASES = @{$CONFIG{bases}};
 my @records;
 my @query_warnings;
@@ -83,7 +105,8 @@ sub cmd_init {
 [defaults]
 authour=
 assignee=
-tag=general
+#=general
+unclaimed=#
 # output=compact   # uncomment to make compact/basic/pretty the default view instead of pipe
 
 [queries]
@@ -171,128 +194,6 @@ sub eval_query_function {
     use strict 'refs';
 
     return @out;
-}
-
-sub expand_base_path {
-    my ($path) = @_;
-    $path = trim($path);
-
-    # ~/foo -> /home/user/foo
-    if ($path =~ /^~(?=\/|$)/) {
-        my $home = $ENV{HOME} || (getpwuid($<))[7] || ".";
-        $path =~ s/^~/$home/;
-    }
-
-    return $path;
-}
-
-# Parses .arkrc, a small ini-style config with these sections:
-#   [bases]            one extra search directory per line
-#   [defaults]         authour=/assignee=/tag= used by `ark tidy`
-#   [queries]          name = query, where indented continuation lines
-#                      (e.g. `;; alt query`) are appended to the same alias
-#   [functions]        name = path/to/file.pl (require'd, must define
-#                      arkfunc_NAME)
-#   [function NAME]    inline Perl body for arkfunc_NAME, read verbatim
-#                      until the next [section]
-sub load_arkrc {
-    my $cfg = ".arkrc";
-
-    my %config = (
-        bases => ["."],
-        functions => {},
-        inline_functions => [],
-        queries => {},
-        defaults => {},
-    );
-
-    return %config unless -f $cfg;
-
-    open my $fh, "<:encoding(UTF-8)", $cfg or return %config;
-
-    my $section = "";
-    my $inline_name = "";
-    my $inline_code = "";
-    my $query_name = "";
-
-    while (my $line = <$fh>) {
-        chomp $line;
-
-        if ($section eq "queries" && $query_name && $line =~ /^\s+(.+)$/) {
-            $config{queries}{$query_name} .= " " . trim($1);
-            next;
-        }
-
-        if ($line =~ /^\s*\[(.+)\]\s*$/) {
-            $query_name = "";
-
-            if ($section eq "function" && length $inline_code) {
-                push @{$config{inline_functions}}, {
-                    name => $inline_name,
-                    code => $inline_code,
-                };
-                $inline_code = "";
-                $inline_name = "";
-            }
-
-            my $header = trim($1);
-
-            if ($header =~ /^function\s+(\w+)$/) {
-                $section = "function";
-                $inline_name = $1;
-            } else {
-                $section = lc $header;
-            }
-
-            next;
-        }
-
-        if ($section eq "function") {
-            $inline_code .= $line . "\n";
-            next;
-        }
-
-        $line = trim($line);
-        next unless length $line;
-        next if $line =~ /^#/;
-
-        if ($section eq "bases") {
-            push @{$config{bases}}, expand_base_path($line);
-        }
-        elsif ($section eq "functions") {
-            my ($name, $path) = split /\s*=\s*/, $line, 2;
-            next unless $name && $path;
-            $config{functions}{$name} = expand_base_path($path);
-        }
-        elsif ($section eq "queries") {
-            my ($name, $query) = split /\s*=\s*/, $line, 2;
-            next unless $name;
-            $query //= "";
-
-            $config{queries}{$name} = $query;
-            $query_name = $name;
-        }
-        elsif ($section eq "defaults") {
-            my ($name, $val) = split /\s*=\s*/, $line, 2;
-            next unless $name;
-            $config{defaults}{$name} = trim($val // "");
-        }
-    }
-
-    if ($section eq "function" && length $inline_code) {
-        push @{$config{inline_functions}}, {
-            name => $inline_name,
-            code => $inline_code,
-        };
-    }
-
-    close $fh;
-
-    if (@{$config{bases}} > 1) {
-        shift @{$config{bases}} if $config{bases}[0] eq ".";
-    }
-
-    return %config;
 }
 
 sub trim {
@@ -579,34 +480,11 @@ sub meta_sort_value {
 
 # ============================================================
 # METADATA
+#
+# parse_meta / parse_meta_token live in lib/ark/core.pl (see
+# load_ark_core below) so the grammar exists in exactly one place,
+# shared with the lib/ark/commands/* scripts.
 # ============================================================
-
-sub parse_meta {
-    my ($raw) = @_;
-    my @items;
-    return @items unless defined $raw;
-
-    for my $tok (split /\s*;\s*/, trim($raw)) {
-        next unless length $tok;
-
-        my ($sym, $val);
-
-        if ($tok =~ /^id\/(.+)/) {
-            ($sym, $val) = ("id/", $1);
-        } else {
-            $sym = substr($tok, 0, 1);
-            $val = substr($tok, 1);
-        }
-
-        push @items, {
-            raw => $tok,
-            sym => $sym,
-            val => $val,
-        };
-    }
-
-    return @items;
-}
 
 sub meta_to_string {
     my ($meta_ref) = @_;
@@ -664,10 +542,22 @@ sub replace_meta_raw {
 sub remove_meta_token {
     my ($meta_ref, $token) = @_;
 
-    # Remove by bare metadata symbol -- e.g. '#' drops every tag.
+    # Remove by bare canonical symbol -- e.g. '#' drops every tag.
     if ($token =~ /^[!%><=\$@~&#\^\/]$/) {
         return [
             grep { index($_->{raw}, $token) != 0 }
+            @$meta_ref
+        ];
+    }
+
+    # Remove by bare named key -- e.g. 'time' drops every time:* field.
+    # Matched by exact sym rather than a raw-text prefix, since key
+    # names vary in length and a prefix match would also wrongly catch
+    # an unrelated longer key sharing the same prefix (e.g. 'time'
+    # matching 'timezone:...').
+    if ($token =~ /^$NAMED_KEY_RE$/) {
+        return [
+            grep { $_->{sym} ne $token }
             @$meta_ref
         ];
     }
@@ -726,7 +616,7 @@ sub replace_meta_token {
 
 sub comparison_field_needed {
     my ($q) = @_;
-    return $1 if $q =~ /^([!%~><])\s*(<=|>=|=|<|>)\s*(.+)$/;
+    return $1 if $q =~ /^([!%~><]|$NAMED_KEY_RE)\s*(<=|>=|=|<|>)\s*(.+)$/;
     return "";
 }
 
@@ -1167,21 +1057,28 @@ sub load_records {
 #
 #   todo / note / evnt      record type
 #   text                    substring match against content + raw meta
-#   -SYM                    has metadata SYM present, e.g. `-#` has a tag
+#   -SYM                    has metadata SYM present, e.g. `-#` has a tag;
+#                           SYM is a canonical symbol or a named key
 #   --SYM                   metadata SYM absent
+#   -KEY:                   has named field KEY present, e.g. `-time:`
+#                           (the trailing colon disambiguates a named
+#                           key from a plain substring search)
+#   --KEY:                  named field KEY absent
 #   -TEXT                   alias for a plain substring/alternation match
 #   --TEXT                  negation of the above
 #   SYM<=VAL, SYM>=VAL, ...
 #     SYM=VAL, SYM<VAL, SYM>VAL
 #                           comparison on a metadata value (! numeric,
-#                           % dates incl. relative like +2w/today, others
+#                           % dates incl. relative like +2w/today, a
+#                           named key or any other canonical symbol
 #                           lexical)
 #   today / week / Nd|Nw|Nm|Ny
 #                           evnt only: start time falls in that window
 #
 # Sorting/dedup tokens (>SYM, <SYM, >>, <<, ><, <>) are stripped out of
 # the query text by query_records() before matching and applied
-# afterwards by sort_records().
+# afterwards by sort_records(). SYM in a sort token is a canonical
+# symbol or a named key, same as everywhere else above.
 # ============================================================
 
 sub parse_query_raw {
@@ -1301,7 +1198,18 @@ sub matches_one {
         return meta_value($r, $1) ne "";
     }
 
-    if ($q =~ /^([!%~><])\s*(<=|>=|=|<|>)\s*(.+)$/) {
+    # Same, for a named key: the trailing colon (`-time:`) is what
+    # marks this as a field-presence check rather than a plain
+    # substring search for the word "time" (see -TEXT/--TEXT below).
+    if ($q =~ /^--($NAMED_KEY_RE):$/) {
+        return meta_value($r, $1) eq "";
+    }
+
+    if ($q =~ /^-($NAMED_KEY_RE):$/) {
+        return meta_value($r, $1) ne "";
+    }
+
+    if ($q =~ /^([!%~><]|$NAMED_KEY_RE)\s*(<=|>=|=|<|>)\s*(.+)$/) {
         return matches_comparison($r, $1, $2, trim($3));
     }
 
@@ -1354,18 +1262,26 @@ sub matches_comparison {
     my $actual = meta_value($r, $sym);
     return 0 unless defined $actual && length $actual;
 
-    $wanted = relative_date_value($wanted) if $sym eq "%";
+    # %/~/>/< are all date-valued canonical fields; relative values like
+    # +2w/today are resolved for any of them, not just the deadline (%)
+    # field -- e.g. an evnt end-date comparison like `<=+30d` needs this
+    # exactly as query_time_range's window-widening already does.
+    $wanted = relative_date_value($wanted) if $sym =~ /^[%~><]$/;
 
+    my $is_canonical = $sym =~ /^[!%~><]$/;
     my $cmp;
 
     if ($sym eq "!") {
         return 0 unless $actual =~ /^\d+$/ && $wanted =~ /^\d+$/;
         $cmp = $actual <=> $wanted;
-    } else {
+    } elsif ($is_canonical) {
         $actual =~ s/T//g;
         $wanted =~ s/T//g;
 
         return 0 unless $actual =~ /^\d+$/ && $wanted =~ /^\d+$/;
+        $cmp = $actual cmp $wanted;
+    } else {
+        # Named field: no assumed format, plain lexical comparison.
         $cmp = $actual cmp $wanted;
     }
 
@@ -1395,9 +1311,9 @@ sub query_records {
 
     @query_warnings = ();
 
-    my @sort_q = $query =~ /(?:^|,)\s*(>>|<<|><|<>|[<>][#!=%@\$\/\^\~])\s*(?=,|$)/g;
+    my @sort_q = $query =~ /(?:^|,)\s*(>>|<<|><|<>|[<>](?:[#!=%@\$\/\^\~]|$NAMED_KEY_RE))\s*(?=,|$)/g;
 
-    $query =~ s/(?:^|,)\s*(?:>>|<<|><|<>|[<>][#!=%@\$\/\^\~])\s*(?=,|$)/,/g;
+    $query =~ s/(?:^|,)\s*(?:>>|<<|><|<>|[<>](?:[#!=%@\$\/\^\~]|$NAMED_KEY_RE))\s*(?=,|$)/,/g;
     $query =~ s/^\s*,\s*//;
     $query =~ s/\s*,\s*$//;
     $query =~ s/,\s*,/,/g;
@@ -1537,7 +1453,8 @@ sub sort_records {
         # <~ = descending creation
         # >! = ascending priority
         # <! = descending priority
-        if ($key =~ /^[#!=%@\$\/\^\~]$/) {
+        # >KEY/<KEY also works for a named key, sorting lexically on its value.
+        if ($key =~ /^(?:[#!=%@\$\/\^\~]|$NAMED_KEY_RE)$/) {
             my $desc = $dir eq "<";
 
             @rs = sort {
@@ -2504,8 +2421,12 @@ ark publish:
 
 .arkrc (repository config, created by 'ark init'):
   [bases]         extra directories to also scan for note/todo/evnt
-  [defaults]      authour=/assignee=/tag=, used by 'ark tidy';
-                  output=MODE sets your preferred default output mode
+  [defaults]      authour=/assignee=/#=, used by 'ark tidy' (#= is the
+                  default tag, aliased from the old tag= name);
+                  unclaimed=SYM/KEY sets what an unclaimed metadata
+                  token (no canonical symbol, no colon) resolves to,
+                  default #; output=MODE sets your preferred default
+                  output mode
   [queries]       name = query   reusable alias, usable as a query word;
                   indented continuation lines extend the same alias.
                   ark init seeds several (overdue, duesoon, undated,
@@ -2658,6 +2579,29 @@ sub load_builtin_arkfuncs {
     die "Could not find arkfuncs.pl\n";
 }
 
+# lib/ark/core.pl provides parse_meta/parse_meta_token, load_arkrc, and
+# friends -- shared with the lib/ark/commands/* scripts so that grammar
+# lives in exactly one place. Required before anything in this file
+# calls load_arkrc() or parse_meta().
+sub load_ark_core {
+    my $script_dir = ark_script_dir();
+
+    my @paths = (
+        "$script_dir/../lib/ark/core.pl",
+        "$ENV{HOME}/.local/lib/ark/core.pl",
+        "/usr/local/lib/ark/core.pl",
+        "/usr/lib/ark/core.pl",
+    );
+
+    for my $path (@paths) {
+        next unless defined $path && -f $path;
+        require $path;
+        return 1;
+    }
+
+    die "Could not find core.pl\n";
+}
+
 # Any command not in the builtin set (help/init/edit/glance/output-mode
 # words) is looked up as an executable file named $cmd in one of the
 # commands/ directories below and exec'd directly -- this is how tidy,
@@ -2756,6 +2700,7 @@ if (dispatch_command($cmd, @ARGV[1 .. $#ARGV])) {
 # Load configured query functions and records after entering the ark root,
 # so .arkrc is read from the repository root.
 %CONFIG = load_arkrc();
+$UNCLAIMED_KEY = resolve_unclaimed_key(%CONFIG);
 @BASES = @{$CONFIG{bases}};
 warn_on_alias_collisions();
 

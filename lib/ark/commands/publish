@@ -28,7 +28,11 @@ binmode(STDERR, ":encoding(UTF-8)");
 my $DOCS_DIR = "docs";
 my $DEBUG = grep { $_ eq "--debug" } @ARGV;
 
-my %conf = read_arkrc(".arkrc");
+require_ark_core();
+our $UNCLAIMED_KEY; # defined in lib/ark/core.pl, set below
+
+my %conf = load_arkrc(".arkrc");
+$UNCLAIMED_KEY = resolve_unclaimed_key(%conf);
 my @publish_tags = @{ $conf{publish_tags} || [] };
 my $no_publish = norm_tag($conf{defaults}{no_publish} // "no_publish");
 
@@ -75,77 +79,24 @@ sub dbg {
     print STDERR "[publish] ", @_, "\n";
 }
 
-sub read_arkrc {
-    my ($path) = @_;
-    my %c = (
-        defaults => {},
-        publish_tags => [],
-        bases => ["."],
+sub require_ark_core {
+    my $cmd_path = abs_path($0) || $0;
+    my $self_dir = dirname($cmd_path);
+
+    my @paths = (
+        "$self_dir/../core.pl",
+        "$ENV{HOME}/.local/lib/ark/core.pl",
+        "/usr/local/lib/ark/core.pl",
+        "/usr/lib/ark/core.pl",
     );
 
-    return %c unless -f $path;
-
-    open my $fh, "<:encoding(UTF-8)", $path or die "Cannot read $path: $!\n";
-    my $section = "";
-
-    while (my $line = <$fh>) {
-        chomp $line;
-        $line =~ s/\r$//;
-        next if $line =~ /^\s*$/;
-
-        if ($line =~ /^\s*\[([^\]]+)\]\s*$/) {
-            $section = lc trim($1);
-            next;
-        }
-
-        next if $line =~ /^\s*#/;
-
-        if ($section eq "defaults") {
-            if ($line =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/) {
-                $c{defaults}{$1} = $2;
-            }
-            elsif ($line =~ /^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$/) {
-                $c{defaults}{$1} = $2;
-            }
-        }
-        elsif ($section eq "publish") {
-            my $tag = $line;
-
-            if ($tag =~ /^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/) {
-                $tag = length($2) ? $2 : $1;
-            }
-
-            $tag = norm_tag($tag);
-            push @{ $c{publish_tags} }, $tag if length $tag;
-        }
-        elsif ($section eq "bases") {
-            my $base = trim($line);
-            push @{ $c{bases} }, expand_base_path($base) if length $base;
-        }
+    for my $path (@paths) {
+        next unless defined $path && -f $path;
+        require $path;
+        return 1;
     }
 
-    close $fh;
-
-    if (@{ $c{bases} } > 1 && $c{bases}[0] eq ".") {
-        shift @{ $c{bases} };
-    }
-
-    my %seen;
-    @{ $c{publish_tags} } = grep { !$seen{$_}++ } @{ $c{publish_tags} };
-
-    return %c;
-}
-
-sub expand_base_path {
-    my ($path) = @_;
-    $path = trim($path);
-
-    if ($path =~ /^~(?=\/|$)/) {
-        my $home = $ENV{HOME} || (getpwuid($<))[7] || ".";
-        $path =~ s/^~/$home/;
-    }
-
-    return $path;
+    die "Could not find core.pl\n";
 }
 
 sub read_template {
@@ -276,34 +227,6 @@ sub scan_notes {
     }
 
     return @notes;
-}
-
-sub parse_meta {
-    my ($raw) = @_;
-    my @items;
-    return @items unless defined $raw;
-
-    for my $tok (split /\s*;\s*/, trim($raw)) {
-        next unless length $tok;
-
-        my ($sym, $val);
-
-        if ($tok =~ /^id\/(.+)/) {
-            ($sym, $val) = ("id/", $1);
-        }
-        else {
-            $sym = substr($tok, 0, 1);
-            $val = substr($tok, 1);
-        }
-
-        push @items, {
-            raw => $tok,
-            sym => $sym,
-            val => $val,
-        };
-    }
-
-    return @items;
 }
 
 sub meta_value {
@@ -959,18 +882,6 @@ sub trim {
 
     $s //= "";
     $s =~ s/^\s+|\s+$//g;
-
-    return $s;
-}
-
-sub norm_tag {
-    my ($s) = @_;
-
-    $s = trim($s // "");
-    $s =~ s/^#//;
-    $s = lc $s;
-    $s =~ s/[^a-z0-9_-]+/-/g;
-    $s =~ s/^-+|-+$//g;
 
     return $s;
 }

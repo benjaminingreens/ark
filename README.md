@@ -1,14 +1,14 @@
 # Ark
 
-install/update v0.1.0-alpha.16
+install/update v0.1.0-alpha.17
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.16/install.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.17/install.sh)"
 ```
 
-install/update v0.1.0-alpha.16 on ish:
+install/update v0.1.0-alpha.17 on ish:
 ```bash
 apk add perl git curl
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.16/install.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/benjaminingreens/ark/v0.1.0-alpha.17/install.sh)"
 ```
 
 Ark is a plain-text terminal organiser for notes, todos, and events.
@@ -100,29 +100,55 @@ evnt: Team meeting {>20260601T1400; <20260601T1500; #work};;
 
 ## Metadata symbols
 
-Each token in a `{...}` block is one leading symbol plus a value,
-separated by `;`:
+Each token in a `{...}` block, separated by `;`, is one of three shapes:
 
-| Symbol | Meaning | Typical type | Example |
-|---|---|---|---|
-| `#` | tag | any | `#work` |
-| `!` | priority (numeric) | todo | `!1` |
-| `%` | deadline (date/datetime) | todo | `%20260601` |
-| `=` | status | todo | `=done` |
-| `$` | authour | any | `$ben` |
-| `@` | assignee | todo | `@jesse` |
-| `/` | title | note (also used as filename slug by tidy) | `/on-liturgy` |
-| `~` | created (timestamp) | any | `~20260601T140000` |
-| `&` | id | any | `&ark20260601140000abcd1234ef56` |
-| `>` | start time | evnt | `>20260601T1400` |
-| `<` | end time | evnt | `<20260601T1500` |
-| `^` | recurrence pattern | evnt | `^1w@wd1-5@h9+3h` (see [Recurring events](#recurring-events)) |
+1. **Canonical** — a fixed, closed set of 12 single-character symbols.
+   The character is the key, everything after it (colons included) is
+   the value:
+
+   | Symbol | Meaning | Typical type | Example |
+   |---|---|---|---|
+   | `#` | tag | any | `#work` |
+   | `!` | priority (numeric) | todo | `!1` |
+   | `%` | deadline (date/datetime) | todo | `%20260601` |
+   | `=` | status | todo | `=done` |
+   | `$` | authour | any | `$ben` |
+   | `@` | assignee | todo | `@jesse` |
+   | `/` | title | note (also used as filename slug by tidy) | `/on-liturgy` |
+   | `~` | created (timestamp) | any | `~20260601T140000` |
+   | `&` | id | any | `&ark20260601140000abcd1234ef56` |
+   | `>` | start time | evnt | `>20260601T1400` |
+   | `<` | end time | evnt | `<20260601T1500` |
+   | `^` | recurrence pattern | evnt | `^1w@wd1-5@h9+3h` (see [Recurring events](#recurring-events)) |
+
+   This set will not grow — see below for defining your own fields.
+
+2. **Named** — anything else, if it contains a colon: everything before
+   the *first* colon is the key, everything after is the value, e.g.
+   `time:00:10` is a field named `time` with value `00:10`. Any key
+   name works; nothing needs to be declared or registered up front.
+   Because canonical symbols are checked first, a canonical token's own
+   value can safely contain a colon without being misread as a named
+   field — `/Meeting: budget review` stays a title, not a field called
+   `Meeting`.
+
+3. **Unclaimed** — anything else with no colon at all: the whole token
+   becomes the value of whatever key `.arkrc`'s `[defaults] unclaimed=`
+   names (`#`, a tag, if unset). So with the default setting, a bare
+   `sermon` token is exactly equivalent to `#sermon` — a quick way to
+   tag something without typing `#`. `ark tidy --clean`/`--tidy` writes
+   the resolved form back into the file, so `{sermon}` becomes
+   `{#sermon}` once tidied.
+
+Nothing is ever rejected: every token maps to one of the three shapes
+above.
 
 Dates/datetimes are `yyyymmdd` or `yyyymmddThhmmss` (seconds optional).
 `ark tidy --clean`/`--tidy` automatically fills in `~created`, `&id`,
-`$authour` (from `.arkrc` if set), and `#tag` (defaulting to `general`)
-for every record, plus `=status`, `!priority`, and `@assignee` for todos —
-you rarely need to type these yourself.
+`$authour` (from `.arkrc` if set), and `#tag` (defaulting to `.arkrc`'s
+`[defaults] #=`, or `general` if that's unset) for every record, plus
+`=status`, `!priority`, and `@assignee` for todos — you rarely need to
+type these yourself.
 
 ---
 
@@ -171,11 +197,23 @@ A query is one or more comma-separated **conditions**, ANDed together;
 | `--text` | negated substring match |
 | `-SYM` | has metadata symbol `SYM` present, e.g. `-#` has a tag, `-^` recurs |
 | `--SYM` | metadata symbol `SYM` absent |
-| `SYM=VAL`, `SYM<VAL`, `SYM>VAL`, `SYM<=VAL`, `SYM>=VAL` | compare a metadata value: `!` numeric, `%` dates (see below), everything else lexical |
+| `-KEY:`, `--KEY:` | same, for a named key, e.g. `-time:` has a `time` field, `--time:` doesn't (the trailing colon is what marks this as a field check, not a plain substring search for the word) |
+| `SYM=VAL`, `SYM<VAL`, `SYM>VAL`, `SYM<=VAL`, `SYM>=VAL` | compare a metadata value, canonical symbol or named key: `!` numeric, `%` dates (see below), everything else lexical |
 | `today`, `week`, `Nd`/`Nw`/`Nm`/`Ny` | evnt only: start time falls within that window from now |
 
-`%` (deadline/created) comparisons accept relative dates: `today`,
-`+2w`, `-3d`, `+1m`, `+1y`, etc., alongside literal `yyyymmdd[Thhmmss]`.
+`%`/`~`/`>`/`<` (deadline/created/evnt start/evnt end) comparisons all
+accept relative dates: `today`, `+2w`, `-3d`, `+1m`, `+1y`, etc.,
+alongside literal `yyyymmdd[Thhmmss]` — e.g. `ark 'evnt, ><=+30d'`
+widens a recurring event's expansion window to 30 days out and only
+returns instances within it.
+
+A named key works in a comparison or presence check the same way a
+canonical symbol does, e.g. `ark 'todo, time>00:05'` or `ark 'todo,
+-time:'` — see [Metadata symbols](#metadata-symbols). Query syntax only
+recognizes identifier-shaped key names (letters/digits/`_`/`-`,
+starting with a letter or `_`); the metadata grammar itself is more
+permissive, so an unusually-named key may need `edit ... remove`'s
+exact-match form rather than being queried directly.
 
 Whenever a query uses a comparison (`SYM<VAL` etc.), ark prints a
 warning above the results if any other record matched the rest of the
@@ -214,7 +252,7 @@ Add a sort token anywhere in the query:
 
 | Token | Meaning |
 |---|---|
-| `>SYM` / `<SYM` | ascending / descending by metadata `SYM`'s value |
+| `>SYM` / `<SYM` | ascending / descending by metadata `SYM`'s value; `SYM` is a canonical symbol or a named key |
 | `>>` | ascending by evnt start (`>`) |
 | `<<` | descending by evnt end (`<`) |
 | `><` | ascending by evnt end (`<`) |
@@ -368,7 +406,7 @@ ark edit 'todo, -#jesse' replace '#jesse' '#family'
 | Op | Alias | Meaning |
 |---|---|---|
 | `add` | `a` | append `TOKEN` unless already present |
-| `remove` | `r` | drop token(s) matching `TOKEN` — an exact token, a bare symbol (drops any token with that symbol, e.g. `#` drops all tags), or a `prefix*` wildcard |
+| `remove` | `r` | drop token(s) matching `TOKEN` — an exact token, a bare symbol/named key (drops any token with that key, e.g. `#` drops all tags, `time` drops all `time:` fields), or a `prefix*` wildcard |
 | `set` | `s` | replace whatever token(s) share `TOKEN`'s symbol with `TOKEN` |
 | `replace` | `p` | swap one exact raw token for another: `replace OLD NEW` |
 
@@ -552,7 +590,8 @@ Created by `ark init` with these defaults:
 [defaults]
 authour=
 assignee=
-tag=general
+#=general
+unclaimed=#
 # output=compact   # uncomment to make compact/basic/pretty the default view instead of pipe
 
 [queries]
@@ -598,18 +637,25 @@ The one-line aliases (`overdue`, `duesoon`, `undated`, `high`, `done`,
 in a `[queries]` entry is a **continuation**, joined onto the same
 alias and split into `;;`-separated steps — the leading `;;` on each
 continuation line above is exactly that separator, not a comment
-(lines starting with `#` *are* comments, and are skipped).
+(lines starting with `#` *are* comments, and are skipped — except
+`#=value` in `[defaults]`, which sets the default tag; see below).
 
 ### Sections
 
 | Section | Contents |
 |---|---|
 | `[bases]` | one extra directory per line to also scan for `note/`, `todo/`, `evnt/` (in addition to the repository root); `~` expands to your home directory |
-| `[defaults]` | `authour=`, `assignee=`, `tag=` (used by `ark tidy`), `no_publish=` (used by `ark publish`), `output=` (used by the query engine — see [Output modes](#output-modes)) |
+| `[defaults]` | `authour=`, `assignee=`, `#=` (the default tag, used by `ark tidy`; older `.arkrc` files may still say `tag=` — both work), `unclaimed=` (which key an unclaimed metadata token resolves to, default `#` — see [Metadata symbols](#metadata-symbols)), `no_publish=` (used by `ark publish`), `output=` (used by the query engine — see [Output modes](#output-modes)) |
 | `[queries]` | `name = query`, a reusable alias usable as a query word; indented continuation lines extend the same alias. A name that collides with a built-in word prints a warning (see [Query aliases](#query-aliases)) |
 | `[functions]` | `name = path/to/file.pl` — a Perl file `require`'d at startup, which must define a sub `arkfunc_name(query, arg, \@records, $run_query)` |
 | `[function name]` | an inline Perl body for `arkfunc_name`, read verbatim until the next `[section]` — an alternative to `[functions]` for small one-off functions |
 | `[publish]` | tag names to publish, one per line (see [Publish](#publish)) |
+
+Ark never rewrites your `.arkrc` except to append a `[defaults]` key
+that's missing but load-bearing (currently only `unclaimed=`) — this
+happens once, the first time a new-enough `ark` runs against an older
+repo, and only ever adds the missing line; nothing you've already set
+is touched, reordered, or duplicated.
 
 ---
 
